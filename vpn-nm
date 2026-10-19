@@ -1,0 +1,3268 @@
+#!/bin/bash
+# VPN backend for the Omarchy shell plugin: WireGuard and OpenVPN profiles,
+# both kept by NetworkManager. NetworkManager brings tunnels up, owns routes
+# and DNS, and keeps keys and passwords where only root can read them.
+# Nothing here needs root; setup asks for your password only to install
+# missing packages.
+#
+#   vpn-nm status        key<TAB>value lines: installed (0 when a package it can't work without is
+#                        missing), missing (any packages to install), openvpn (1 when OpenVPN support
+#                        is installed), service, network (NetworkManager's state) and killswitch, then
+#                        one line per active VPN connection:
+#                          vpn<TAB>uuid<TAB>kind<TAB>state<TAB>name<TAB>ip<TAB>iface<TAB>sent<TAB>recv<TAB>seconds<TAB>hop
+#                        kind is wg or ovpn; state connecting, connected or disconnecting. hop is n/total
+#                        for a connection that's part of a chain (uuid and name are then its profile's).
+#   vpn-nm profiles      One TSV line per profile, each followed by those nested inside it:
+#                          uuid kind name iface address server routes all-traffic autoconnect via depth
+#                          group group-auto auth username password has-password asks
+#                        via is the profile it's nested inside, depth how deep that is, group the name
+#                        of the group it heads, group-auto 1 when that group connects automatically.
+#                        For OpenVPN: auth is tls, password, password-tls or static-key; password is
+#                        save, ask or none; asks is 1 when the private key's password is asked for.
+#   vpn-nm move <uuid> [[--above] <uuid>]
+#                        Moves one profile, as in a list: just under the second (which then carries
+#                        it, and it what the second carried), with --above in front of the second, or
+#                        with one uuid, out of its group. What it carried closes up behind it.
+#   vpn-nm group <uuid> <name> [<autoconnect 1|0>]
+#                        Names the group the profile is in (empty: no name), and sets whether the panel
+#                        connects it automatically.
+#   vpn-nm import <file>...           WireGuard .conf and OpenVPN .ovpn files; prints each new uuid.
+#   vpn-nm import-text [name]         A config read from stdin, likewise.
+#   vpn-nm paste [name]               The config on the clipboard, likewise.
+#   vpn-nm candidates [dir]           Profile files in dir (default ~/Downloads): mtime<TAB>kind<TAB>path.
+#   vpn-nm browse [dir]               File chooser (desktop portal); prints the chosen paths.
+#   vpn-nm save <uuid> <name> <autoconnect 1|0> [--via <uuid>] [--user <name>]
+#                        [--password save|ask] [--password-stdin] [--all-traffic 1|0]
+#                        Saves the profile's settings. --via moves it under that profile ("" for out of
+#                        its group). The OpenVPN options set the username, whether the password is kept
+#                        (the first line on stdin is the one to keep), and whether all traffic goes
+#                        through it. One profile or group at most connects automatically: turning it on
+#                        turns it off for the rest, printing auto-off<TAB>name for each.
+#   vpn-nm remove <uuid>              Takes it out of its group, then removes it.
+#   vpn-nm killswitch on|off          While on, the internet only works through a VPN.
+#   vpn-nm connect [--auto] <uuid> [--user <name>] [--save|--ask] [--password-stdin]
+#                        A profile in a group connects the whole group, in order. An OpenVPN profile
+#                        reports status, info, error, prompt and done lines, and reads each prompt's
+#                        answer as a line on stdin. --auto: only what's set to connect automatically,
+#                        and not after you've disconnected it, while nothing else is connected.
+#   vpn-nm disconnect [uuid]          The whole group, for a profile in one. Without one, every VPN.
+#   vpn-nm edit <uuid>                In a terminal: the profile's config in your editor.
+#   vpn-nm setup                      In a terminal: installs missing packages, places the icon.
+
+set -uo pipefail
+
+PLUGIN_ID=io.github.fivefold3.vpn-manager
+OFFERED_FILE=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-vpn-manager/setup-offered
+
+# Packages, each with a file it installs: checking for the file is quick
+# enough for every status check. None are bundled; setup offers to install
+# whichever are missing. The first two it can't work without.
+REQUIRED=(
+  "networkmanager:/usr/bin/nmcli"
+  "python-gobject:/usr/lib/python3*/site-packages/gi/__init__.py"
+)
+OPTIONAL=(
+  "networkmanager-openvpn:/usr/lib/NetworkManager/VPN/nm-openvpn-service.name"
+  "wl-clipboard:/usr/bin/wl-paste"
+)
+
+missing_from() {
+  local dep missing=()
+  for dep in "$@"; do
+    compgen -G "${dep#*:}" >/dev/null || missing+=("${dep%%:*}")
+  done
+  echo "${missing[*]}"
+}
+
+missing_packages() { missing_from "${REQUIRED[@]}" "${OPTIONAL[@]}"; }
+installed() { [[ -z $(missing_from "${REQUIRED[@]}") ]]; }
+openvpn_installed() { [[ -z $(missing_from "${OPTIONAL[0]}") ]]; }
+nm_running() { [[ $(nmcli -t -f RUNNING general 2>/dev/null) == running ]]; }
+
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
+# Reading and changing profiles goes through libnm. Importing uses
+# NetworkManager's own parsers, for wg-quick files and .ovpn files, but adds
+# the profile itself, with the settings the plugin wants from the start.
+# Keys and passwords go to NetworkManager over D-Bus: never argv, the
+# environment or a file.
+read -r -d '' HELPER <<'PY'
+import os, sys
+
+import gi
+gi.require_version("NM", "1.0")
+from gi.repository import GLib, NM
+
+WG_MAX = 256 * 1024            # a WireGuard config
+OVPN_MAX = 2 * 1024 * 1024     # an .ovpn file, certificates and all
+OPENVPN = "org.freedesktop.NetworkManager.openvpn"
+PASSWORD_TYPES = ("password", "password-tls")
+CERT_DIRS = [os.path.expanduser(d) + "/" for d in
+             ("~/.local/share/networkmanagement/certificates/nm-openvpn", "~/.cert/nm-openvpn")]
+
+# What the plugin keeps, it keeps in the profiles, as NetworkManager user
+# data: it has no files of its own.
+NS = "io.github.fivefold3.vpn-manager."
+VIA = NS + "via"                       # the profile this one is nested inside, and connects through
+GROUP = NS + "group"                   # a group's name, in its first profile
+GROUP_AUTO = NS + "group-autoconnect"  # "1": the panel connects the group automatically
+AUTO = NS + "autoconnect"              # "1": the panel connects this OpenVPN profile automatically
+# A chain connects copies of its profiles, made for it and deleted when they
+# disconnect. Each copy says which profile it is, and its place: "2/3".
+OF = NS + "of"
+HOP = NS + "hop"
+
+def fail(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+def field(s):
+    return (s or "").replace("\t", " ").replace("\n", " ")
+
+def client():
+    try:
+        return NM.Client.new(None)
+    except GLib.Error:
+        fail("NetworkManager isn't running.")
+
+def wait(start, finish):
+    # Runs one libnm async call to completion (the sync versions are deprecated).
+    loop = GLib.MainLoop()
+    out = {}
+    def done(_source, result, *_):
+        try:
+            out["value"] = finish(result)
+        except GLib.Error as e:
+            out["error"] = e
+        loop.quit()
+    start(done)
+    loop.run()
+    if "error" in out:
+        raise out["error"]
+    return out.get("value")
+
+def kind(c):
+    # "wg", "ovpn", or "" for anything else.
+    if c is None:
+        return ""
+    t = c.get_connection_type()
+    if t == NM.SETTING_WIREGUARD_SETTING_NAME:
+        return "wg"
+    if t == NM.SETTING_VPN_SETTING_NAME:
+        s = c.get_setting_vpn()
+        if s is not None and s.get_service_type() == OPENVPN:
+            return "ovpn"
+    return ""
+
+def user_data(c, key):
+    u = c.get_setting(NM.SettingUser) if c is not None else None
+    if u is None:
+        return ""
+    return u.get_data(key) or ""
+
+def set_user_data(c, key, value):
+    # On a copy of a profile, before saving it.
+    u = c.get_setting(NM.SettingUser)
+    if u is None:
+        u = NM.SettingUser.new()
+        c.add_setting(u)
+    u.set_data(key, value or None)
+
+def is_copy(c):
+    return bool(user_data(c, OF))
+
+def tree(nm):
+    # The profiles in the panel's order, each followed by those nested inside
+    # it: (profile, parent uuid, depth). One nested inside a profile that's
+    # gone, or in a loop, goes at the top.
+    profiles = sorted((c for c in nm.get_connections() if kind(c) and not is_copy(c)),
+                      key=lambda c: c.get_id().lower())
+    uuids = {c.get_uuid() for c in profiles}
+    children = {}
+    for c in profiles:
+        via = user_data(c, VIA)
+        children.setdefault(via if via in uuids and via != c.get_uuid() else "", []).append(c)
+    out, seen = [], set()
+    def walk(c, parent, depth):
+        seen.add(c.get_uuid())
+        out.append((c, parent, depth))
+        for child in children.get(c.get_uuid(), []):
+            if child.get_uuid() not in seen:
+                walk(child, c.get_uuid(), depth + 1)
+    # The second pass catches loops, which nothing at the top leads to.
+    for c in children.get("", []) + profiles:
+        if c.get_uuid() not in seen:
+            walk(c, "", 0)
+    return out
+
+def group_of(nm, c):
+    # The group c is in, outermost first: the profiles it's nested inside,
+    # itself, and those nested in it, one inside the next.
+    child = {}
+    for p, parent, _ in tree(nm):
+        if parent:
+            child.setdefault(parent, p)
+    path = chain_to(nm, c)
+    while path[-1].get_uuid() in child:
+        path.append(child[path[-1].get_uuid()])
+    return path
+
+def chain_to(nm, c):
+    # The profiles c is nested inside, outermost first, then c itself.
+    parents = {p.get_uuid(): (p, parent) for p, parent, _ in tree(nm)}
+    path, uuid = [], c.get_uuid()
+    while uuid:
+        p, uuid = parents[uuid]
+        path.insert(0, p)
+    return path
+
+def find(nm, uuid):
+    c = nm.get_connection_by_uuid(uuid)
+    if c is None or not kind(c) or is_copy(c):
+        fail("Profile no longer exists.")
+    return c
+
+def save(nm, c, new):
+    flags = NM.SettingsUpdate2Flags.TO_DISK
+    # Saving can make NetworkManager connect an autoconnect profile; one
+    # that's down was most likely disconnected on purpose.
+    if not any(a.get_uuid() == c.get_uuid() for a in nm.get_active_connections()):
+        flags |= NM.SettingsUpdate2Flags.BLOCK_AUTOCONNECT
+    try:
+        wait(lambda cb: c.update2(new.to_dbus(NM.ConnectionSerializationFlags.ALL),
+                                  flags, None, None, cb, None),
+             c.update2_finish)
+    except GLib.Error as e:
+        fail("NetworkManager couldn't save profile: " + e.message)
+
+def autoconnects(c):
+    # Whether the profile, on its own, connects automatically: a WireGuard
+    # one by NetworkManager itself, an OpenVPN one by the panel, since
+    # NetworkManager doesn't connect VPNs automatically.
+    if kind(c) == "wg":
+        return c.get_setting_connection().get_autoconnect()
+    return user_data(c, AUTO) == "1"
+
+def set_autoconnect(out, on):
+    if kind(out) == "wg":
+        out.get_setting_connection().props.autoconnect = on
+    else:
+        set_user_data(out, AUTO, "1" if on else None)
+
+# --- WireGuard ---
+
+def peers(c):
+    w = c.get_setting(NM.SettingWireGuard)
+    return [w.get_peer(i) for i in range(w.get_peers_len())] if w else []
+
+def allowed_ips(peer):
+    out = []
+    for i in range(peer.get_allowed_ips_len()):
+        ip = peer.get_allowed_ip(i, None)
+        out.append(ip[0] if isinstance(ip, tuple) else ip)
+    return [ip for ip in out if ip]
+
+def first_address(c):
+    for ip in (c.get_setting_ip4_config(), c.get_setting_ip6_config()):
+        if ip is not None and ip.get_num_addresses() > 0:
+            a = ip.get_address(0)
+            return "%s/%d" % (a.get_address(), a.get_prefix())
+    return ""
+
+def load_keys(c):
+    # Puts the profile's keys, which NetworkManager hands to your session,
+    # into c. False when it doesn't keep them itself (they're asked for at
+    # connect time instead): they'd come out blank.
+    try:
+        v = wait(lambda cb: c.get_secrets_async(NM.SETTING_WIREGUARD_SETTING_NAME, None, cb, None),
+                 c.get_secrets_finish)
+        if v is not None:
+            c.update_secrets(NM.SETTING_WIREGUARD_SETTING_NAME, v)
+    except GLib.Error as e:
+        fail("NetworkManager couldn't provide keys: " + e.message)
+    unkept = NM.SettingSecretFlags.AGENT_OWNED | NM.SettingSecretFlags.NOT_SAVED
+    return bool(c.get_setting(NM.SettingWireGuard).get_private_key()) and not any(
+        not p.get_preshared_key() and p.get_preshared_key_flags() & unkept for p in peers(c))
+
+def split_endpoint(endpoint):
+    host, _, port = endpoint.rpartition(":")
+    return host.strip("[]"), port
+
+# --- OpenVPN ---
+
+def flags(s, key):
+    try:
+        return int(s.get_data_item(key) or 0)
+    except ValueError:
+        return 0
+
+def remotes(c):
+    # An OpenVPN profile's servers, in order: (host, port, proto). Port and
+    # proto are "" where the entry doesn't give one.
+    s = c.get_setting_vpn()
+    out = []
+    for item in (s.get_data_item("remote") or "").replace(" ", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.startswith("["):
+            host, _, rest = item[1:].partition("]")
+            parts = rest[1:].split(":") if rest.startswith(":") else []
+        elif item.count(":") > 2 or "::" in item:
+            host, parts = item, []  # a bare IPv6 address
+        else:
+            host, *parts = item.split(":")
+        out.append((host, parts[0] if parts else "", parts[1] if len(parts) > 1 else ""))
+    return out
+
+def remote_port(c, port):
+    return port or c.get_setting_vpn().get_data_item("port") or "1194"
+
+def set_remotes(c, items):
+    def text(host, port, proto):
+        out = "[%s]" % host if ":" in host else host
+        if port or proto:
+            out += ":" + port
+        if proto:
+            out += ":" + proto
+        return out
+    c.get_setting_vpn().add_data_item("remote", ", ".join(text(*i) for i in items))
+
+def password_mode(s):
+    if s.get_data_item("connection-type") not in PASSWORD_TYPES:
+        return "none"
+    return "save" if flags(s, "password-flags") == 0 else "ask"
+
+def asks_key_password(s):
+    f = flags(s, "cert-pass-flags")
+    return bool(f & (NM.SettingSecretFlags.AGENT_OWNED | NM.SettingSecretFlags.NOT_SAVED)) and not (
+        f & NM.SettingSecretFlags.NOT_REQUIRED)
+
+def vpn_secrets(c):
+    # Only secrets NetworkManager keeps itself come back here.
+    try:
+        v = wait(lambda cb: c.get_secrets_async("vpn", None, cb, None), c.get_secrets_finish)
+    except GLib.Error:
+        return None
+    return v
+
+def saved_password(c):
+    v = vpn_secrets(c)
+    return bool(v and v.unpack().get("vpn", {}).get("secrets", {}).get("password"))
+
+def unready(c):
+    # Why an OpenVPN profile can't connect with nobody there to type
+    # anything, or "". Puts its saved secrets into c, for copying.
+    v = vpn_secrets(c)
+    if v is not None:
+        try:
+            c.update_secrets("vpn", v)
+        except GLib.Error:
+            pass
+    s = c.get_setting_vpn()
+    if s.get_data_item("connection-type") in PASSWORD_TYPES:
+        if not (s.get_data_item("username") or "").strip():
+            return "has no username saved"
+        if flags(s, "password-flags") != 0 or not s.get_secret("password"):
+            return "has no password saved"
+    if asks_key_password(s):
+        return "asks for its private key password at each connect"
+    return ""
+
+def all_traffic(c):
+    if kind(c) == "wg":
+        w = c.get_setting(NM.SettingWireGuard)
+        ip4 = c.get_setting_ip4_config()
+        # All traffic means the IPv4 internet: a lone ::/0 is usually there
+        # to stop IPv6 leaking around a split tunnel. Table = off adds no routes.
+        return (w is not None and w.get_peer_routes()
+                and "0.0.0.0/0" in [ip for p in peers(c) for ip in allowed_ips(p)]
+                and not (ip4 and ip4.get_never_default()))
+    ip4 = c.get_setting_ip4_config()
+    return not (ip4 and ip4.get_never_default())
+
+def ovpn_plugin():
+    info = NM.VpnPluginInfo.list_find_by_service(NM.VpnPluginInfo.list_load(), OPENVPN)
+    try:
+        return info.load_editor_plugin()
+    except (AttributeError, GLib.Error):
+        fail("OpenVPN support isn't installed. Run setup to install networkmanager-openvpn.")
+
+# Each OpenVPN profile routes through a table of its own, as NetworkManager
+# does for a WireGuard full tunnel: the main table's own routes first (your
+# local network, the VPN's server), then the profile's, for packets without
+# a firewall mark. Routing is as before, but the kill switch, which hides
+# the main table's default route, lets it through, and a chain's WireGuard
+# packets, which are marked, never go into it.
+OVPN_PRIORITY = 31800
+
+def table_of(c):
+    # From the profile's uuid: well away from the tables NetworkManager picks
+    # for WireGuard (51820 and up) and the kill switch's.
+    return 7000000 + int(c.get_uuid().replace("-", "")[:8], 16) % 1000000
+
+def ip_settings(c):
+    import socket
+    return [(ip, fam) for ip, fam in ((c.get_setting_ip4_config(), socket.AF_INET),
+                                      (c.get_setting_ip6_config(), socket.AF_INET6))
+            if ip is not None and ip.get_method() not in ("disabled", "ignore")]
+
+def own_table(c, table):
+    for ip, fam in ip_settings(c):
+        ip.props.route_table = table
+        ip.clear_routing_rules()
+        rule = NM.IPRoutingRule.new(fam)
+        rule.set_priority(OVPN_PRIORITY)
+        rule.set_table(254)
+        rule.set_suppress_prefixlength(0)
+        rule.validate()
+        ip.add_routing_rule(rule)
+        rule = NM.IPRoutingRule.new(fam)
+        rule.set_priority(OVPN_PRIORITY + 1)
+        rule.set_fwmark(0, 0xffffffff)
+        rule.set_table(table)
+        rule.validate()
+        ip.add_routing_rule(rule)
+
+def routing_state(c):
+    # "own" when the profile routes as above, "none" when it has no routing
+    # of its own, and "hand" for routing set some other way, left alone.
+    tables = {ip.get_route_table() for ip, _ in ip_settings(c)}
+    rules = sum(ip.get_num_routing_rules() for ip, _ in ip_settings(c))
+    if tables <= {0} and rules == 0:
+        return "none"
+    if tables == {table_of(c)} and rules == 2 * len(ip_settings(c)):
+        return "own"
+    return "hand"
+
+def ensure_own_table(nm, c):
+    if kind(c) == "ovpn" and routing_state(c) == "none":
+        out = NM.SimpleConnection.new_clone(c)
+        own_table(out, table_of(c))
+        save(nm, c, out)
+
+def ask_key_password(s):
+    # An encrypted key's passphrase can't be given at connect time while
+    # NetworkManager thinks it keeps it itself, so it's asked for each time.
+    key = s.get_data_item("key")
+    if key and s.get_data_item("cert-pass-flags") is None:
+        try:
+            with open(key, "rb") as f:
+                head = f.read(65536)
+        except OSError:
+            return
+        if b"ENCRYPTED" in head:
+            s.add_data_item("cert-pass-flags", "2")
+
+def data_values(s):
+    return {s.get_data_item(k) or "" for k in s.get_data_keys() or []} if s else set()
+
+def extracted_files(s):
+    # Certificate and key files an import extracted from the profile's file:
+    # those directly inside NetworkManager's certificate folders. A path that
+    # only starts like one (.../nm-openvpn/../../.ssh/...) isn't one.
+    out = set()
+    for v in data_values(s):
+        for d in CERT_DIRS:
+            name = v[len(d):] if v.startswith(d) else ""
+            if name and "/" not in name and name not in (".", ".."):
+                out.add(v)
+    return out
+
+def delete_unused(nm, files, uuid, now=None):
+    # Deletes those of files that no profile uses any more. uuid's own
+    # profile counts as now (its settings after a change), or as gone. Only
+    # a regular file right inside a certificate folder is ever deleted.
+    import stat
+    still_used = data_values(now)
+    for other in nm.get_connections():
+        if other.get_uuid() != uuid and kind(other) == "ovpn" and not is_copy(other):
+            still_used |= data_values(other.get_setting_vpn())
+    folders = {os.path.realpath(d) for d in CERT_DIRS}
+    for path in files - still_used:
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode) or os.path.realpath(os.path.dirname(path)) not in folders:
+                continue
+            os.remove(path)
+        except OSError:
+            pass
+
+def cert_base(nm, name, uuid=None):
+    # A name for an .ovpn file whose inline certificates NetworkManager's
+    # importer extracts as <name>-ca.pem and so on: one that can't overwrite
+    # a certificate another profile uses.
+    import re, secrets
+    base = re.sub(r"[/\x00]", "_", name).lstrip(".") or "profile"
+    taken = set()
+    for other in nm.get_connections():
+        if other.get_uuid() != uuid and kind(other) == "ovpn":
+            taken |= data_values(other.get_setting_vpn())
+    while any(v.startswith(d + base + "-") for v in taken for d in CERT_DIRS):
+        base = "%s-%s" % (base.rsplit("-", 1)[0] if re.search(r"-[0-9a-f]{6}$", base) else base, secrets.token_hex(3))
+    return base
+
+# --- Listing ---
+
+def server_text(c):
+    if kind(c) == "wg":
+        ps = [q for q in peers(c) if q.get_endpoint()]
+        text = ps[0].get_endpoint() if ps else ""
+        return text + (" +%d" % (len(peers(c)) - 1) if len(peers(c)) > 1 else "")
+    rs = remotes(c)
+    if not rs:
+        return ""
+    host, port, proto = rs[0]
+    text = ("[%s]" % host if ":" in host else host) + ":" + remote_port(c, port)
+    if len(rs) > 1:
+        text += " +%d" % (len(rs) - 1)
+    if (proto or ("tcp" if c.get_setting_vpn().get_data_item("proto-tcp") == "yes" else "")).startswith("tcp"):
+        text += " · TCP"
+    return text
+
+def cmd_profiles(args):
+    nm = client()
+    for c, via, depth in tree(nm):
+        auth = user = routes = iface = address = ""
+        password, has_password, asks = "none", "0", "0"
+        if kind(c) == "wg":
+            routes = ", ".join(ip for p in peers(c) for ip in allowed_ips(p))
+            iface, address = c.get_interface_name() or "", first_address(c)
+        else:
+            s = c.get_setting_vpn()
+            auth = s.get_data_item("connection-type") or "tls"
+            user = s.get_data_item("username") or ""
+            password = password_mode(s)
+            has_password = "1" if password == "save" and saved_password(c) else "0"
+            asks = "1" if asks_key_password(s) else "0"
+        row = [c.get_uuid(), kind(c), c.get_id(), iface, address, server_text(c), routes,
+               "1" if all_traffic(c) else "0", "1" if autoconnects(c) else "0", via, str(depth),
+               user_data(c, GROUP), "1" if user_data(c, GROUP_AUTO) == "1" else "0",
+               auth, user, password, has_password, asks]
+        print("\t".join(field(f) for f in row))
+
+# --- Importing ---
+
+def unique_name(nm, name, uuid=None):
+    taken = {c.get_id() for c in nm.get_connections() if c.get_uuid() != uuid}
+    candidate, n = name, 2
+    while candidate in taken:
+        candidate, n = "%s %d" % (name, n), n + 1
+    return candidate
+
+def interface_name(stem, taken):
+    # NetworkManager names a WireGuard interface after the file, as wg-quick
+    # does, so use the file's name when it's a free, valid one (wg-quick's
+    # rule); otherwise wg0, wg1...
+    import re
+    if re.fullmatch(r"[A-Za-z0-9_=+.-]{1,15}", stem) and stem not in (".", "..") and stem not in taken:
+        return stem
+    n = 0
+    while "wg%d" % n in taken:
+        n += 1
+    return "wg%d" % n
+
+def taken_interfaces(nm):
+    return {c.get_interface_name() for c in nm.get_connections()} | set(os.listdir("/sys/class/net"))
+
+def looks_like(data):
+    import re
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]  # a byte-order mark, which Windows editors add
+    if re.search(rb"^[ \t]*\[interface\]", data.lower(), re.M):
+        return "wg"
+    if re.search(rb"^[ \t]*(remote|client)([ \t]|\r?$)", data, re.M):
+        return "ovpn"
+    return ""
+
+def in_memory(data, filename, read):
+    # The importers read a file, and name things after it, so they get an
+    # in-memory one behind a link with the name wanted: the config itself
+    # never touches the disk. Returns read(link), with the link's path
+    # taken out of its errors.
+    import re, tempfile
+    fd = os.memfd_create("omarchy-vpn-manager")
+    tmp = link = None
+    try:
+        os.write(fd, data)
+        tmp = tempfile.mkdtemp(prefix="omarchy-vpn-manager-", dir=os.environ.get("XDG_RUNTIME_DIR") or None)
+        link = os.path.join(tmp, filename)
+        os.symlink("/proc/self/fd/%d" % fd, link)
+        return read(link)
+    except GLib.Error as e:
+        msg = e.message
+        if link:
+            msg = re.sub(r" at %s:(\d+)" % re.escape(link), r" on line \1", msg).replace(link, "it")
+        raise ValueError(msg)
+    finally:
+        os.close(fd)
+        for f, remove in ((link, os.remove), (tmp, os.rmdir)):
+            try:
+                f and remove(f)
+            except OSError:
+                pass
+
+def parse_wg(data, iface, label):
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]  # a byte-order mark, which the parser rejects
+    try:
+        c = in_memory(data, iface + ".conf", NM.conn_wireguard_import)
+    except ValueError as e:
+        raise ValueError("%s: %s" % (label, e))
+    except OSError as e:
+        raise ValueError("%s: can't read (%s)." % (label, e.strerror))
+    if not c.get_setting(NM.SettingWireGuard).get_private_key():
+        raise ValueError("%s is missing a PrivateKey." % label)
+    if not peers(c):
+        raise ValueError("%s is missing a [Peer] section." % label)
+    return c
+
+# The .ovpn directives that name a certificate or key file.
+FILE_DIRECTIVES = ("ca", "cert", "key", "pkcs12", "tls-auth", "tls-crypt", "tls-crypt-v2", "secret",
+                   "crl-verify", "extra-certs", "dh")
+
+def absolute_refs(data, folder):
+    # The .ovpn file with the files it names, which are found next to it,
+    # given by absolute path instead, so a copy of it can be read elsewhere.
+    import re
+    directive = re.compile(rb"^([ \t]*)(" + b"|".join(re.escape(d.encode()) for d in FILE_DIRECTIVES)
+                           + rb")([ \t]+)(.*?)\r?$")
+    out = []
+    for line in data.split(b"\n"):
+        m = directive.match(line)
+        if m:
+            indent, word, gap, rest = m.groups()
+            if rest[:1] in (b'"', b"'"):
+                end = rest.find(rest[:1], 1)
+                arg, tail = (rest[1:end], rest[end + 1:]) if end > 0 else (rest[1:], b"")
+            else:
+                arg, space, tail = rest.partition(b" ")
+                tail = space + tail
+            if arg and arg != b"[inline]" and not arg.startswith(b"/"):
+                full = os.path.join(folder.encode(), arg).replace(b"\\", b"\\\\").replace(b'"', b'\\"')
+                line = indent + word + gap + b'"' + full + b'"' + tail
+        out.append(line)
+    return b"\n".join(out)
+
+def parse_ovpn(nm, data, path, name, label):
+    # NetworkManager's own .ovpn importer. Certificates and keys inline in
+    # the file are extracted to files named after it, and it overwrites files
+    # of the same name, so it reads a copy named after the new profile, which
+    # no other profile's files are, with the files the original names (found
+    # next to it) given by absolute path.
+    plugin = ovpn_plugin()
+    if path:
+        data = absolute_refs(data, os.path.dirname(path))
+    try:
+        c = in_memory(data, cert_base(nm, name) + ".ovpn", plugin.import_)
+    except GLib.Error as e:
+        raise ValueError("%s: %s" % (label, e.message))
+    except ValueError as e:
+        raise ValueError("%s: %s" % (label, e))
+    except OSError as e:
+        raise ValueError("%s: can't read (%s)." % (label, e.strerror))
+
+    def bad(msg):
+        discard(nm, c)
+        raise ValueError(msg)
+    # The importer leaves out what NetworkManager fills in, the uuid and
+    # the connection's type among it.
+    try:
+        c.normalize()
+    except GLib.Error as e:
+        bad("%s: %s" % (label, e.message))
+    s = c.get_setting_vpn()
+    if s is None or s.get_service_type() != OPENVPN:
+        bad("NetworkManager couldn't read %s as an OpenVPN profile." % (label if path else "config"))
+    if not remotes(c):
+        bad("%s is missing a remote (server address)." % label)
+    return c
+
+def discard(nm, c):
+    # The certificate and key files the importer extracted, for a profile
+    # that isn't added after all: unless another profile uses them.
+    s = c.get_setting_vpn() if c is not None else None
+    if s is not None:
+        delete_unused(nm, extracted_files(s), "")
+
+def add_profile(nm, c, name, label):
+    # Adds a parsed config as a new profile, not connecting automatically:
+    # connecting is the user's call. Returns its uuid.
+    s = c.get_setting_connection()
+    s.props.id = unique_name(nm, name)
+    s.props.autoconnect = False
+    if kind(c) == "ovpn":
+        ask_key_password(c.get_setting_vpn())
+        own_table(c, table_of(c))
+    try:
+        wait(lambda cb: nm.add_connection2(c.to_dbus(NM.ConnectionSerializationFlags.ALL),
+                                           NM.SettingsAddConnection2Flags.TO_DISK,
+                                           None, False, None, cb, None),
+             nm.add_connection2_finish)
+    except GLib.Error as e:
+        raise ValueError("%s: NetworkManager couldn't add profile: %s" % (label, e.message))
+    return c.get_uuid()
+
+def import_data(nm, taken, data, path, name, label):
+    import re
+    k = looks_like(data)
+    if k == "wg":
+        if len(data) > WG_MAX:
+            raise ValueError("%s is too big for a WireGuard profile." % label)
+        # A file's own name, for the interface, as wg-quick does; a pasted
+        # config has none, so its interface is wg0, wg1...
+        stem = re.sub(r"\.conf$", "", os.path.basename(path), flags=re.I) if path else ""
+        iface = interface_name(stem, taken)
+        uuid = add_profile(nm, parse_wg(data, iface, label), name, label)
+        taken.add(iface)
+        return uuid
+    if k == "ovpn":
+        c = parse_ovpn(nm, data, path, name, label)
+        try:
+            return add_profile(nm, c, name, label)
+        except ValueError:
+            discard(nm, c)
+            raise
+    raise ValueError("%s isn't a WireGuard or OpenVPN profile." % label)
+
+def cmd_import(args):
+    import re
+    if not args:
+        fail("Choose a WireGuard .conf or OpenVPN .ovpn file to import.")
+    nm = client()
+    taken = taken_interfaces(nm)
+    errors = []
+    for path in args:
+        path = os.path.abspath(os.path.expanduser(path))
+        base = os.path.basename(path)
+        try:
+            with open(path, "rb") as f:
+                data = f.read(OVPN_MAX + 1)
+        except OSError:
+            errors.append("Can't read %s." % base)
+            continue
+        if len(data) > OVPN_MAX:
+            errors.append("%s is too big for a VPN profile." % base)
+            continue
+        name = re.sub(r"\.(conf|ovpn)$", "", base, flags=re.I) or base
+        try:
+            print(import_data(nm, taken, data, path, name, base))
+        except ValueError as e:
+            errors.append(str(e))
+    if errors:
+        fail("\n".join(errors))
+
+def cmd_import_text(args):
+    clipboard = "--clipboard" in args
+    args = [a for a in args if a != "--clipboard"]
+    data = sys.stdin.buffer.read(OVPN_MAX + 1)
+    if len(data) > OVPN_MAX:
+        fail("Clipboard content is too big for a VPN config." if clipboard else "Config is too big.")
+    if not data.strip():
+        fail("Clipboard is empty or holds no text. Copy config text first."
+             if clipboard else "No config given.")
+    k = looks_like(data)
+    if not k:
+        fail("Clipboard doesn't contain a WireGuard or OpenVPN config." if clipboard else "Not a WireGuard or OpenVPN config.")
+    name = (args[0] if args else "").strip() or ("WireGuard" if k == "wg" else "OpenVPN")
+    nm = client()
+    try:
+        print(import_data(nm, taken_interfaces(nm), data, None, name, "Config"))
+    except ValueError as e:
+        fail(str(e))
+
+# --- Editing the config ---
+
+def wg_quick(c):
+    # The profile as a wg-quick file, private key included: the inverse of
+    # NetworkManager's importer, for the settings that importer reads.
+    if not load_keys(c):
+        # Saving would drop the key that came out blank.
+        fail("NetworkManager doesn't store profile's keys, so config can't be edited here.")
+    w = c.get_setting(NM.SettingWireGuard)
+    addresses, dns, search = [], [], []
+    for ip in (c.get_setting_ip4_config(), c.get_setting_ip6_config()):
+        if ip is None:
+            continue
+        for i in range(ip.get_num_addresses()):
+            a = ip.get_address(i)
+            addresses.append("%s/%d" % (a.get_address(), a.get_prefix()))
+        dns += [ip.get_dns(i) for i in range(ip.get_num_dns())]
+        # Search domains go in DNS too, "~" (all domains) included.
+        search += [ip.get_dns_search(i) for i in range(ip.get_num_dns_searches())]
+    ip4 = c.get_setting_ip4_config()
+    out = ["# Comments aren't kept. PreUp/PostUp/PreDown/PostDown are ignored.",
+           "[Interface]", "PrivateKey = " + w.get_private_key()]
+    if addresses:
+        out.append("Address = " + ", ".join(addresses))
+    if dns or search:
+        out.append("DNS = " + ", ".join(dict.fromkeys(dns + search)))
+    if w.get_listen_port():
+        out.append("ListenPort = %d" % w.get_listen_port())
+    if w.get_fwmark():
+        out.append("FwMark = 0x%x" % w.get_fwmark())
+    if w.get_mtu():
+        out.append("MTU = %d" % w.get_mtu())
+    if not w.get_peer_routes():
+        out.append("Table = off")
+    elif ip4 is not None and ip4.get_route_table():
+        out.append("Table = %d" % ip4.get_route_table())
+    for p in peers(c):
+        out += ["", "[Peer]", "PublicKey = " + (p.get_public_key() or "")]
+        if p.get_preshared_key():
+            out.append("PresharedKey = " + p.get_preshared_key())
+        if allowed_ips(p):
+            out.append("AllowedIPs = " + ", ".join(allowed_ips(p)))
+        if p.get_endpoint():
+            out.append("Endpoint = " + p.get_endpoint())
+        if p.get_persistent_keepalive():
+            out.append("PersistentKeepalive = %d" % p.get_persistent_keepalive())
+    return "\n".join(out) + "\n"
+
+def cmd_export(args):
+    # Writes the profile to a file in <dir>, readable by you alone, and
+    # prints its path: <interface>.conf for WireGuard, <name>.ovpn for
+    # OpenVPN, which holds no username or password, and names certificates
+    # by path.
+    if len(args) != 2:
+        fail("usage: export <uuid> <dir>")
+    nm = client()  # kept: the profile goes stale once the client is gone
+    c = find(nm, args[0])
+    if kind(c) == "wg":
+        text = wg_quick(c)
+        path = os.path.join(args[1], (c.get_interface_name() or "wg0") + ".conf")
+    else:
+        # Named so that certificates pasted in inline, which the importer
+        # extracts as <file name>-ca.pem and so on, can't overwrite another
+        # profile's.
+        path = os.path.join(args[1], cert_base(nm, c.get_id(), c.get_uuid()) + ".ovpn")
+        tmp = path + ".export"
+        try:
+            ovpn_plugin().export(tmp, c)
+            with open(tmp) as f:
+                body = f.read()
+            os.remove(tmp)
+        except (GLib.Error, OSError) as e:
+            fail("NetworkManager couldn't export profile: " + str(getattr(e, "message", e)))
+        text = ("# Comments aren't kept. Up/down scripts are ignored. Username and password\n"
+                "# aren't included: change them in profile settings.\n" + body)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    print(path)
+
+def cmd_apply(args):
+    # Puts what the edited file says into the profile. Only the settings the
+    # file can express change; everything else about the profile (its name,
+    # autoconnect, nesting, and for OpenVPN, the username, how passwords are
+    # kept, and whether all traffic goes through it) stays.
+    if len(args) != 2:
+        fail("usage: apply <uuid> <file>")
+    nm = client()
+    c = find(nm, args[0])
+    try:
+        with open(args[1], "rb") as f:
+            data = f.read(OVPN_MAX + 1)
+    except OSError:
+        fail("Edited file is missing.")
+    if len(data) > (WG_MAX if kind(c) == "wg" else OVPN_MAX):
+        fail("Config is too big.")
+    if kind(c) == "wg":
+        apply_wg(nm, c, data)
+    else:
+        apply_ovpn(nm, c, args[1])
+
+def apply_wg(nm, c, data):
+    try:
+        new = parse_wg(data, c.get_interface_name() or "wg0", "The config")
+    except ValueError as e:
+        fail(str(e))
+    out = NM.SimpleConnection.new_clone(c)
+    w, nw = out.get_setting(NM.SettingWireGuard), new.get_setting(NM.SettingWireGuard)
+    for prop in ("private-key", "listen-port", "fwmark", "mtu", "peer-routes"):
+        w.set_property(prop, nw.get_property(prop))
+    w.clear_peers()
+    for p in peers(new):
+        w.append_peer(p)
+    for setting in (NM.SettingIP4Config, NM.SettingIP6Config):
+        n, o = new.get_setting(setting), out.get_setting(setting)
+        if n is None:
+            continue
+        if o is None:
+            out.add_setting(n.duplicate())
+            continue
+        o.props.method = n.get_method()
+        o.clear_addresses()
+        for i in range(n.get_num_addresses()):
+            o.add_address(n.get_address(i))
+        o.clear_dns()
+        for i in range(n.get_num_dns()):
+            o.add_dns(n.get_dns(i))
+        o.clear_dns_searches()
+        for i in range(n.get_num_dns_searches()):
+            o.add_dns_search(n.get_dns_search(i))
+        o.props.route_table = n.get_route_table()
+    save(nm, c, out)
+
+def apply_ovpn(nm, c, path):
+    try:
+        new = ovpn_plugin().import_(path)
+    except GLib.Error as e:
+        fail(e.message.replace(path, "the file"))
+    s, old = new.get_setting_vpn(), c.get_setting_vpn()
+    if s is None or s.get_service_type() != OPENVPN:
+        fail("NetworkManager couldn't read edited file as an OpenVPN profile.")
+    for key in old.get_data_keys() or []:
+        if key == "username" or key.endswith("-flags"):
+            s.add_data_item(key, old.get_data_item(key))
+    ask_key_password(s)
+    # The routing kept: all traffic or not, and the profile's routing table.
+    everything = all_traffic(c)
+    for kind_ in (NM.SettingIP4Config, NM.SettingIP6Config):
+        n, o = new.get_setting(kind_), c.get_setting(kind_)
+        if n is None or o is None:
+            continue
+        n.props.never_default = not everything
+        n.props.route_table = o.get_route_table()
+        n.clear_routing_rules()
+        for i in range(o.get_num_routing_rules()):
+            n.add_routing_rule(o.get_routing_rule(i))
+    for setting in (NM.SettingConnection, NM.SettingUser):
+        new.remove_setting(setting.__gtype__)
+    new.add_setting(c.get_setting_connection().duplicate())
+    if c.get_setting(NM.SettingUser) is not None:
+        new.add_setting(c.get_setting(NM.SettingUser).duplicate())
+    files = extracted_files(old)
+    # Saved passwords stay: NetworkManager keeps them when an update leaves them out.
+    save(nm, c, new)
+    # Certificates the file no longer names, extracted by an earlier import.
+    delete_unused(nm, files, c.get_uuid(), s)
+
+# --- Nesting ---
+
+def set_via(nm, c, via, autoconnect_off):
+    out = NM.SimpleConnection.new_clone(c)
+    set_user_data(out, VIA, via)
+    off = autoconnect_off and autoconnects(c)
+    if off:
+        set_autoconnect(out, False)
+    save(nm, c, out)
+    return off
+
+def move(nm, uuid, target_uuid, above):
+    # Moves one profile in the chains, as in a list: out of where it is
+    # (the profile it carried closes up behind it), then in just under
+    # another (taking over what that one carried), in front of one
+    # (above: just under the one before it, or above a group's first
+    # profile, first itself, carrying the rest), or out to the top. Groups'
+    # names stay with their groups. True when automatic connecting was
+    # turned off, since a profile in a group connects only with it.
+    c = find(nm, uuid)
+    target = find(nm, target_uuid) if target_uuid else None
+    if target is not None and target.get_uuid() == c.get_uuid():
+        fail("A profile can't connect through itself.")
+    rows = tree(nm)
+    parent = {p.get_uuid(): via for p, via, _ in rows}
+    child = {}
+    for p, via, _ in rows:
+        if via:
+            child.setdefault(via, p)
+    if above and parent[target.get_uuid()]:
+        # In front of one that's nested: just under the one before it.
+        if parent[target.get_uuid()] == c.get_uuid():
+            return False  # there already
+        target, above = find(nm, parent[target.get_uuid()]), False
+    old_via, old_child = parent[c.get_uuid()], child.get(c.get_uuid())
+    if not above and target is not None and old_via == target.get_uuid():
+        return False
+    if target is None and not old_via and old_child is None:
+        return False
+    off = False
+    # Leaving the head of its group: the group's name goes to the next one.
+    if not old_via and old_child is not None and (user_data(c, GROUP) or user_data(c, GROUP_AUTO) == "1"):
+        set_group_data(nm, old_child, user_data(c, GROUP), user_data(c, GROUP_AUTO) == "1")
+        set_group_data(nm, c, "", False)
+    if old_child is not None:
+        set_via(nm, old_child, old_via, False)
+    if above:
+        off = set_via(nm, c, "", True) | set_via(nm, target, c.get_uuid(), True)
+    elif target is not None:
+        displaced = child.get(target.get_uuid())
+        if displaced is not None and displaced.get_uuid() != c.get_uuid():
+            set_via(nm, displaced, c.get_uuid(), False)
+        off = set_via(nm, c, target.get_uuid(), True) | set_via(nm, target, user_data(target, VIA), True)
+    else:
+        set_via(nm, c, "", False)
+    # Read afresh: the client here may not have caught up with the saves.
+    tidy_groups(client())
+    return off
+
+def cmd_move(args):
+    above = len(args) == 3 and args[1] == "--above"
+    if above:
+        args = [args[0], args[2]]
+    if len(args) not in (1, 2) or (above and not args[1]):
+        fail("usage: move <uuid> [[--above] <uuid>]")
+    if move(client(), args[0], args[1] if len(args) == 2 else "", above):
+        print("autoconnect-off")
+
+def cmd_group(args):
+    # Names the group a profile is in (an empty name takes it off) and,
+    # given, sets whether the plugin connects it automatically.
+    if len(args) not in (2, 3) or (len(args) == 3 and args[2] not in ("0", "1")):
+        fail("usage: group <uuid> <name> [<autoconnect 1|0>]")
+    name = " ".join(args[1].split())
+    nm = client()
+    root = chain_to(nm, find(nm, args[0]))[0]
+    auto = args[2] == "1" if len(args) == 3 else user_data(root, GROUP_AUTO) == "1"
+    if auto:
+        for p in group_of(nm, root):
+            why = unready(p) if kind(p) == "ovpn" else ""
+            if why:
+                fail("%s %s, so group can't connect automatically." % (p.get_id(), why))
+    if user_data(root, GROUP) == name and (user_data(root, GROUP_AUTO) == "1") == auto:
+        return
+    set_group_data(nm, root, name, auto)
+    if auto:
+        only_auto(nm, root.get_uuid())
+
+def set_group_data(nm, c, name, auto):
+    out = NM.SimpleConnection.new_clone(c)
+    set_user_data(out, GROUP, name)
+    set_user_data(out, GROUP_AUTO, "1" if auto else None)
+    save(nm, c, out)
+
+def tidy_groups(nm):
+    # A group's name and autoconnect belong to its first profile. One that
+    # no longer heads a group (everything was moved out of it) loses them;
+    # one that's been nested in another hands them to the new first
+    # profile, unless that has its own.
+    rows = tree(nm)
+    carrying = {via for _, via, _ in rows if via}
+    changes = {}
+    # Nested in a profile that's gone (or in a loop): at the top now.
+    unnest = {p.get_uuid(): p for p, via, _ in rows if user_data(p, VIA) and not via}
+    for p, via, _ in rows:
+        name, auto = user_data(p, GROUP), user_data(p, GROUP_AUTO) == "1"
+        if not name and not auto:
+            continue
+        if via:
+            head = chain_to(nm, p)[0]
+            if not user_data(head, GROUP) and user_data(head, GROUP_AUTO) != "1" and head.get_uuid() not in changes:
+                changes[head.get_uuid()] = (head, name, auto)
+        elif p.get_uuid() in carrying:
+            continue
+        changes.setdefault(p.get_uuid(), (p, "", False))
+    for uuid in set(changes) | set(unnest):
+        c, name, auto = changes.get(uuid) or (unnest[uuid], None, None)
+        out = NM.SimpleConnection.new_clone(c)
+        if name is not None:
+            set_user_data(out, GROUP, name)
+            set_user_data(out, GROUP_AUTO, "1" if auto else None)
+        if uuid in unnest:
+            set_user_data(out, VIA, "")
+        save(nm, c, out)
+
+# --- Saving and removing ---
+
+def read_line():
+    # Byte by byte from fd 0, unbuffered, so what follows on the pipe (an
+    # answer to a later prompt) is left for whoever reads fd 0 next.
+    line = bytearray()
+    while True:
+        b = os.read(0, 1)
+        if not b or b == b"\n":
+            return os.fsdecode(bytes(line))
+        line += b
+
+def cmd_save(args):
+    # save <uuid> <name> <autoconnect 1|0> [--via <uuid>] [--user <name> | --user-stdin]
+    #      [--password save|ask] [--password-stdin] [--all-traffic 1|0]
+    # The first three are always those, so a profile can be called "--user".
+    # On stdin: the username (--user-stdin), then the password.
+    usage = ("usage: save <uuid> <name> <autoconnect 1|0> [--via <uuid>] [--user <name> | --user-stdin] "
+             "[--password save|ask] [--password-stdin] [--all-traffic 1|0]")
+    if len(args) < 3 or args[2] not in ("0", "1"):
+        fail(usage)
+    opts, i = {}, 3
+    while i < len(args):
+        a = args[i]
+        if a in ("--via", "--user", "--password", "--all-traffic") and i + 1 < len(args):
+            opts[a[2:]] = args[i + 1]
+            i += 2
+        elif a in ("--user-stdin", "--password-stdin"):
+            opts[a[2:]] = True
+            i += 1
+        else:
+            fail(usage)
+    if opts.get("password", "save") not in ("save", "ask") or opts.get("all-traffic", "1") not in ("0", "1"):
+        fail(usage)
+    uuid, name, auto = args[0], " ".join(args[1].split()), args[2] == "1"
+    if opts.get("user-stdin"):
+        opts["user"] = read_line()
+    password = read_line() if opts.get("password-stdin") else None
+    nm = client()
+    c = find(nm, uuid)
+    if not name:
+        fail("Enter a profile name.")
+    if any(o.get_uuid() != uuid and o.get_id() == name for o in nm.get_connections()):
+        fail("Name %s is already used by another connection." % name)
+    user = opts.get("user")
+    if user is not None and ("\t" in user or "\n" in user):
+        fail("Username can't contain tabs or line breaks.")
+    if kind(c) == "ovpn":
+        s = c.get_setting_vpn()
+        needs = s.get_data_item("connection-type") in PASSWORD_TYPES
+        if needs and user is not None and not user.strip():
+            fail("Enter username.")
+    # Moved first, so the rest is saved to the profile as it then stands.
+    if "via" in opts and opts["via"] != user_data(c, VIA):
+        move(nm, uuid, opts["via"], False)
+        nm = client()
+        c = find(nm, uuid)
+    grouped = any(via and (p.get_uuid() == uuid or via == uuid) for p, via, _ in tree(nm))
+    auto = auto and not grouped  # a profile in a group connects only with it
+    out = NM.SimpleConnection.new_clone(c)
+    out.get_setting_connection().props.id = name
+    if kind(c) == "ovpn":
+        s = out.get_setting_vpn()
+        needs = s.get_data_item("connection-type") in PASSWORD_TYPES
+        if needs and user is not None:
+            s.add_data_item("username", user.strip())
+        mode = opts.get("password")
+        if needs and mode == "ask":
+            s.add_data_item("password-flags", "2")
+            s.remove_secret("password")
+        elif needs and mode == "save":
+            s.add_data_item("password-flags", "0")
+            if password:
+                s.add_secret("password", password)
+        if needs and auto:
+            # Nobody's there to type it when it connects on its own.
+            if flags(s, "password-flags") != 0:
+                fail("Save password to enable automatic connection.")
+            if not password and not saved_password(c):
+                fail("Enter password to save and enable automatic connection.")
+            if not (s.get_data_item("username") or "").strip():
+                fail("Enter username to enable automatic connection.")
+        if auto and asks_key_password(s):
+            fail("Can't connect automatically: private key password is asked for at each connect.")
+        if "all-traffic" in opts:
+            for ip in (out.get_setting_ip4_config(), out.get_setting_ip6_config()):
+                if ip is not None:
+                    ip.props.never_default = opts["all-traffic"] == "0"
+    set_autoconnect(out, auto)
+    save(nm, c, out)
+    # Only one profile or group connects automatically. Prints what stopped.
+    if auto:
+        only_auto(client(), uuid)
+
+def cmd_remove(args):
+    if len(args) != 1:
+        fail("No profile given.")
+    nm = client()
+    c = find(nm, args[0])
+    # Out of its group first, as when it's moved out: the profile it carried
+    # closes up behind it, and the group's name and automatic connecting
+    # stay with the group.
+    move(nm, args[0], "", False)
+    nm = client()
+    c = find(nm, args[0])
+    files = extracted_files(c.get_setting_vpn()) if kind(c) == "ovpn" else set()
+    try:
+        wait(lambda cb: c.delete_async(None, cb, None), c.delete_finish)
+    except GLib.Error as e:
+        fail("NetworkManager couldn't remove profile: " + e.message)
+    nm = client()
+    # A group that's down to one profile ends.
+    tidy_groups(nm)
+    # Certificates its import extracted, unless another profile uses them.
+    delete_unused(nm, files, args[0])
+
+# --- Connecting automatically ---
+#
+# One profile or group at most connects automatically: a WireGuard profile
+# through NetworkManager's own autoconnect, an OpenVPN profile or a group
+# through the panel. Connecting anything else counts as disconnecting it: it
+# goes down and doesn't come back on its own until you connect it, or start
+# afresh (log in again for the panel's, restart for NetworkManager's), but
+# it stays set to.
+
+# Your runtime folder is in memory, yours alone, and goes when you log out.
+def runtime_file(name):
+    d = os.environ.get("XDG_RUNTIME_DIR")
+    return os.path.join(d, name) if d and os.path.isdir(d) else None
+
+# The small files several of these processes change, each change made under
+# a short lock of its own and written whole, then swapped in.
+import contextlib
+
+@contextlib.contextmanager
+def state_change():
+    import fcntl
+    path = runtime_file("omarchy-vpn-manager-state.lock")
+    f = open(path, "a") if path else None
+    try:
+        if f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+    finally:
+        if f:
+            f.close()
+
+def write_state(name, text):
+    import tempfile
+    path = runtime_file(name)
+    if path is None:
+        return
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="." + name + ".")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+# What you disconnected isn't connected automatically again until you
+# connect it, or log in again: its (first) profile's uuid is kept here.
+def held():
+    try:
+        with open(runtime_file("omarchy-vpn-manager-held")) as f:
+            return set(f.read().split())
+    except (OSError, TypeError):
+        return set()
+
+def hold(uuid, on):
+    with state_change():
+        uuids = held()
+        if (uuid in uuids) == on:
+            return
+        uuids = uuids | {uuid} if on else uuids - {uuid}
+        write_state("omarchy-vpn-manager-held", "".join(u + "\n" for u in sorted(uuids)))
+
+def cmd_hold(args):
+    if len(args) != 2 or args[1] not in ("0", "1"):
+        fail("usage: hold <uuid> 1|0")
+    hold(args[0], args[1] == "1")
+
+def panel_auto(c):
+    # Whether the panel connects it (an OpenVPN profile on its own, or a
+    # group, by its first profile) automatically.
+    return user_data(c, GROUP_AUTO) == "1" or (kind(c) == "ovpn" and user_data(c, AUTO) == "1")
+
+def auto_owners(nm):
+    rows = tree(nm)
+    carrying = {via for _, via, _ in rows if via}
+    return [p for p, via, _ in rows if autoconnects(p)
+            or (not via and p.get_uuid() in carrying and user_data(p, GROUP_AUTO) == "1")]
+
+def auto_label(nm, a):
+    if user_data(a, GROUP_AUTO) != "1":
+        return a.get_id()
+    return user_data(a, GROUP) or " › ".join(p.get_id() for p in group_of(nm, a))
+
+def only_auto(nm, keep):
+    # Turns automatic connecting off for everything but keep, printing
+    # "auto-off<TAB>name" for each, for the panel to say so.
+    for a in auto_owners(nm):
+        if a.get_uuid() == keep:
+            continue
+        label = auto_label(nm, a)
+        out = NM.SimpleConnection.new_clone(a)
+        if kind(a) == "wg":
+            out.get_setting_connection().props.autoconnect = False
+        set_user_data(out, AUTO, None)
+        set_user_data(out, GROUP_AUTO, None)
+        save(nm, a, out)
+        print("auto-off\t" + field(label))
+
+def put_aside(nm, a):
+    # Something else is being connected: a, set to connect automatically,
+    # is disconnected as if you'd done it.
+    if panel_auto(a):
+        hold(a.get_uuid(), True)
+        up = chain_up(nm)
+        if up and user_data(up[0].get_connection(), OF) == a.get_uuid():
+            take_down(nm, up)
+        take_down(nm, [x for x in vpn_active(nm) if x.get_uuid() == a.get_uuid()])
+    if kind(a) == "wg" and a.get_setting_connection().get_autoconnect():
+        active = [x for x in vpn_active(nm) if x.get_uuid() == a.get_uuid()]
+        if active:
+            # NetworkManager doesn't reconnect one you disconnect.
+            take_down(nm, active)
+        else:
+            # Nor one saved with autoconnect blocked, which save() does for
+            # one that's down.
+            save(nm, a, NM.SimpleConnection.new_clone(a))
+
+# One connect or disconnect at a time. One the panel starts by itself
+# (--auto) gives way: it doesn't wait for another, and one you start stops
+# it first, then takes down whatever it had connected so far. stop_auto
+# False waits for it instead, and a uuid stops only one connecting that.
+_turn = []
+
+def auto_running(pid=False):
+    # The profile the panel's connecting by itself, or "" (with its pid).
+    try:
+        with open(runtime_file("omarchy-vpn-manager-auto")) as p:
+            n, _, uuid = p.read().strip().partition(" ")
+        with open("/proc/%d/cmdline" % int(n), "rb") as p:
+            if b"\0connect\0--auto\0" in p.read():
+                return (int(n), uuid) if pid else uuid
+    except (OSError, TypeError, ValueError):
+        pass
+    return (0, "") if pid else ""
+
+def take_turn(auto, uuid="", stop_auto=True):
+    import fcntl, signal, time
+    path = runtime_file("omarchy-vpn-manager.lock")
+    if path is None:
+        return True
+    f = open(path, "a")
+    _turn.append(f)  # the lock lasts as long as this process
+    if auto:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        write_state("omarchy-vpn-manager-auto", "%d %s\n" % (os.getpid(), uuid))
+        return True
+    stopped = ""
+    if stop_auto:
+        pid, stopped = auto_running(True)
+        if stopped and (stop_auto is True or stop_auto == stopped):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                stopped = ""
+        else:
+            stopped = ""
+    # An OpenVPN profile connected automatically can take a minute and a half.
+    end = time.monotonic() + (20 if stop_auto else 120)
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() > end:
+                fail("Another change is in progress. Try again in a moment.")
+            time.sleep(0.1)
+    if stopped:
+        nm = client()
+        up = chain_up(nm)
+        if up and user_data(up[0].get_connection(), OF) == stopped:
+            take_down(nm, up)
+        sweep_copies(nm)
+        resync_kill()
+    return True
+
+def end_turn():
+    # Lets the next change go ahead while this process carries on.
+    while _turn:
+        _turn.pop().close()
+
+# Stopping a connect (the panel's Cancel, say) arrives as SIGTERM: a chain
+# being connected is taken down again, as far as it got.
+class Cancelled(Exception):
+    pass
+
+_stop = []
+
+def on_stop(*_):
+    _stop.append(True)
+
+# --- Chains ---
+#
+# A profile nested inside others connects as a chain: aus > zch > usa means
+# you reach aus's server directly, zch's through aus's tunnel, and usa's
+# through zch's, and usa carries your traffic. Each profile in the chain is
+# connected as a copy, changed to suit: the stored profiles stay as they
+# are, and a copy is deleted when it disconnects. WireGuard and OpenVPN mix.
+#
+# Each copy before the last carries only a route to the next one's server:
+# no default route and no DNS. The last routes what its config says, as on
+# its own. When that's everything, it takes all traffic not marked with a
+# firewall mark, through a routing table of its own, after the main table's
+# routes more specific than a default one: NetworkManager does that itself
+# for WireGuard, and an OpenVPN copy is set up the same way. Every WireGuard
+# copy marks its own packets with that mark, and OpenVPN's own packets go to
+# a server the main table has a route to, so each one's packets go into the
+# tunnel before it, and the first's go out to the network.
+#
+# Only the first server is reached directly, and only its name is looked
+# up the usual way. Each later server's name is looked up once the tunnel
+# before it is up, with that tunnel's own DNS server, through it: while
+# that happens, the tunnel routes the DNS server and nothing else, then
+# the server it found and nothing else. So nothing about a later hop goes
+# anywhere but through the hops before it. NetworkManager can't change an
+# OpenVPN connection's routes once it's up, so a profile inside an OpenVPN
+# one needs its server given as an address.
+
+PLAIN_MTU = 1420         # WireGuard's own, when the config doesn't set one
+OVPN_CARRY_MTU = 1400    # what fits inside an OpenVPN tunnel without fragmenting, roughly
+CARRY_METRIC = 50        # a carrier's route to the next server
+# NetworkManager adds an OpenVPN connection's own route to its server, over
+# the network: for one inside another tunnel, below both the route through
+# that tunnel and the kill switch's blackhole.
+OVPN_INNER_METRIC = 9500
+
+def vpn_active(nm):
+    return [a for a in nm.get_active_connections() if kind(a.get_connection())]
+
+def chain_up(nm):
+    # The copies connected, outermost first.
+    hops = []
+    for a in vpn_active(nm):
+        c = a.get_connection()
+        if is_copy(c):
+            hops.append((int(user_data(c, HOP).partition("/")[0] or 0), a))
+    return [a for _, a in sorted(hops, key=lambda h: h[0])]
+
+def settle(done, timeout):
+    # Lets NetworkManager's news in until done(), or the timeout; says which.
+    import time
+    end = time.monotonic() + timeout
+    tick = GLib.timeout_add(100, lambda: True)
+    try:
+        while not done():
+            if _stop:
+                raise Cancelled()
+            if time.monotonic() > end:
+                return False
+            GLib.MainContext.default().iteration(True)
+        return True
+    finally:
+        GLib.source_remove(tick)
+
+def delete(c):
+    try:
+        wait(lambda cb: c.delete_async(None, cb, None), c.delete_finish)
+    except GLib.Error:
+        pass  # already gone
+
+def sweep_copies(nm):
+    # Copies that aren't connected: left by a connect that was cut short.
+    active = {a.get_uuid() for a in nm.get_active_connections()}
+    for c in nm.get_connections():
+        if is_copy(c) and c.get_uuid() not in active:
+            delete(c)
+
+def connect_copy(nm, copy, base=None):
+    # NetworkManager can't add a profile and connect it in one go, so: add
+    # it in memory, connect it, then make it volatile, so it's deleted when
+    # it disconnects. That has to wait until it's connecting: a volatile
+    # profile that isn't goes straight away. An OpenVPN copy connects over
+    # base, an active connection, which its own route to its server then
+    # goes through.
+    settings = copy.to_dbus(NM.ConnectionSerializationFlags.ALL)
+    c = wait(lambda cb: nm.add_connection2(settings, NM.SettingsAddConnection2Flags.IN_MEMORY |
+                                           NM.SettingsAddConnection2Flags.BLOCK_AUTOCONNECT,
+                                           None, False, None, cb, None),
+             nm.add_connection2_finish)
+    c = c[0] if isinstance(c, tuple) else c
+    try:
+        a = wait(lambda cb: nm.activate_connection_async(c, None, base.get_path() if base else None, None, cb, None),
+                 nm.activate_connection_finish)
+        wait(lambda cb: c.update2(settings, NM.SettingsUpdate2Flags.IN_MEMORY_ONLY | NM.SettingsUpdate2Flags.VOLATILE |
+                                  NM.SettingsUpdate2Flags.NO_REAPPLY, None, None, cb, None),
+             c.update2_finish)
+    except GLib.Error:
+        delete(c)
+        raise
+    return a
+
+def take_down(nm, actives):
+    # One at a time, innermost first, each gone before the next goes.
+    # False when one's still there after all.
+    gone = True
+    for a in reversed(actives):
+        try:
+            wait(lambda cb: nm.deactivate_connection_async(a, None, cb, None), nm.deactivate_connection_finish)
+        except GLib.Error:
+            pass  # already going
+        gone = settle(lambda: a.get_path() not in {x.get_path() for x in nm.get_active_connections()}, 10) and gone
+    return gone
+
+def rx_bytes(iface):
+    try:
+        with open("/sys/class/net/%s/statistics/rx_bytes" % iface) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return 0
+
+def poke(host, port):
+    # A byte into a tunnel, to make it shake hands with its server. It's
+    # sent on to the next server, which ignores it, or into the void.
+    import socket
+    try:
+        with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(b"\0", (host, int(port)))
+    except (OSError, ValueError):
+        pass
+
+def poke_target(copy):
+    # For the last copy: somewhere its AllowedIPs cover (a documentation
+    # address for everything), which its server drops. None when it routes
+    # nothing itself (Table = off): a poke would go around the tunnels.
+    w = copy.get_setting(NM.SettingWireGuard)
+    if w is None or not w.get_peer_routes():
+        return None
+    nets = allowed_nets(copy)
+    for n in sorted(nets, key=lambda n: n.version):
+        if n.prefixlen == 0:
+            return ("192.0.2.1" if n.version == 4 else "2001:db8::1"), 9
+        return str(next(iter(n.hosts()), n.network_address)), 9
+    return None
+
+def literal(host):
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host.partition("%")[0])
+    except ValueError:
+        return None
+
+def servers_of(c):
+    # Where a profile connects to: (host, port) for each WireGuard peer with
+    # an endpoint, or each OpenVPN remote.
+    if kind(c) == "wg":
+        return [split_endpoint(q.get_endpoint()) for q in peers(c) if q.get_endpoint()]
+    return [(h, remote_port(c, p)) for h, p, _ in remotes(c)]
+
+def proxy_of(c):
+    # An OpenVPN profile's HTTP or SOCKS proxy, (host, port), which it
+    # connects to in place of its servers; or None.
+    if kind(c) != "ovpn":
+        return None
+    s = c.get_setting_vpn()
+    if (s.get_data_item("proxy-type") or "none") == "none" or not s.get_data_item("proxy-server"):
+        return None
+    return s.get_data_item("proxy-server"), s.get_data_item("proxy-port") or "8080"
+
+def contacted(c):
+    # What a profile on its own, or first in a group, sends to directly:
+    # its servers, and its proxy.
+    proxy = proxy_of(c)
+    return servers_of(c) + ([proxy] if proxy else [])
+
+def families(c):
+    # The address families a WireGuard tunnel has an address in, and so can carry.
+    import socket
+    return [fam for ip, fam in ((c.get_setting_ip4_config(), socket.AF_INET),
+                                (c.get_setting_ip6_config(), socket.AF_INET6))
+            if ip is not None and ip.get_num_addresses() > 0]
+
+def allowed_nets(c):
+    import ipaddress
+    return [ipaddress.ip_network(a, strict=False) for q in peers(c) for a in allowed_ips(q)]
+
+def why_not_carried(carrier, carrier_name, addr):
+    # Why the carrier can't send to addr, or None when it can. An OpenVPN
+    # tunnel's addresses come from its server, so that's for it to say.
+    import socket
+    if kind(carrier) != "wg":
+        return None
+    if (socket.AF_INET6 if addr.version == 6 else socket.AF_INET) not in families(carrier):
+        return "%s has no IPv%d tunnel address" % (carrier_name, addr.version)
+    # WireGuard only sends to addresses in a peer's AllowedIPs.
+    if not any(addr.version == n.version and addr in n for n in allowed_nets(carrier)):
+        return "not in %s's AllowedIPs" % carrier_name
+    return None
+
+def add_route(c, addr):
+    # A route to one address through the copy's tunnel, in the main table.
+    import socket
+    v6 = addr.version == 6
+    ip = c.get_setting_ip6_config() if v6 else c.get_setting_ip4_config()
+    ip.add_route(NM.IPRoute.new(socket.AF_INET6 if v6 else socket.AF_INET, str(addr), 128 if v6 else 32, None, CARRY_METRIC))
+
+def route_dests(c):
+    return sorted(ip.get_route(i).get_dest() for ip in (c.get_setting_ip4_config(), c.get_setting_ip6_config())
+                  if ip is not None for i in range(ip.get_num_routes()))
+
+def tunnel_dns(p, carrier):
+    # p's own DNS servers that its copy, the carrier, can send to.
+    out = []
+    for ip in (p.get_setting_ip4_config(), p.get_setting_ip6_config()):
+        for i in range(ip.get_num_dns() if ip is not None else 0):
+            a = literal(ip.get_dns(i).partition("#")[0])
+            if a is not None and a not in out and why_not_carried(carrier, "", a) is None:
+                out.append(a)
+    return out
+
+def dns_answers(reply, qid, qtype):
+    # The addresses in a DNS reply, or None when it isn't one to this query.
+    import ipaddress, struct
+    def skip_name(pos):
+        while True:
+            n = reply[pos]
+            if n == 0:
+                return pos + 1
+            if n & 0xC0 == 0xC0:
+                return pos + 2
+            pos += n + 1
+    try:
+        rid, flags_, qd, an, _, _ = struct.unpack("!HHHHHH", reply[:12])
+        if rid != qid or not flags_ & 0x8000:
+            return None
+        if flags_ & 0xF:
+            return []  # no such name, or the server failed
+        pos = 12
+        for _ in range(qd):
+            pos = skip_name(pos) + 4
+        out = []
+        for _ in range(an):
+            pos = skip_name(pos)
+            rtype, _, _, size = struct.unpack("!HHIH", reply[pos:pos + 10])
+            pos += 10
+            # A CNAME's target comes after it, as the A or AAAA records asked for.
+            if rtype == qtype and size == (4 if qtype == 1 else 16):
+                out.append(ipaddress.ip_address(reply[pos:pos + size]))
+            pos += size
+        return out
+    except (IndexError, struct.error, ValueError):
+        return []
+
+def lookup(host, dns, fams):
+    # The addresses host stands for, asked of these DNS servers in plain
+    # DNS: A, then AAAA, in the families given. Each server is reached by
+    # whatever routes it, here the tunnel the lookup is for. Raises
+    # ValueError with why not.
+    import random, socket
+    try:
+        labels = host.rstrip(".").encode("idna").split(b".")
+    except UnicodeError:
+        raise ValueError("invalid hostname")
+    qname = b"".join(bytes([len(l)]) + l for l in labels) + b"\0"
+    answered = False
+    for fam in fams:
+        qtype = 1 if fam == socket.AF_INET else 28
+        for server in dns:
+            for _ in range(3):
+                qid = random.getrandbits(16)
+                query = qid.to_bytes(2, "big") + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname + bytes([0, qtype, 0, 1])
+                try:
+                    with socket.socket(socket.AF_INET6 if server.version == 6 else socket.AF_INET, socket.SOCK_DGRAM) as s:
+                        s.settimeout(2)
+                        s.connect((str(server), 53))
+                        s.send(query)
+                        while True:
+                            found = dns_answers(s.recv(4096), qid, qtype)
+                            if found is not None:
+                                break
+                except OSError:
+                    continue  # no answer in time: ask again
+                answered = True
+                if found:
+                    return found
+                break
+    raise ValueError("no address found" if answered else "no answer from %s" % " or ".join(str(d) for d in dns))
+
+def chain_mark(path):
+    # The last profile's own firewall mark, or one no routing rule uses.
+    import re, subprocess
+    own = path[-1].get_setting(NM.SettingWireGuard).get_fwmark() if kind(path[-1]) == "wg" else 0
+    if own:
+        return own
+    used = set()
+    for fam in ("-4", "-6"):
+        try:
+            out = subprocess.run(["ip", fam, "rule", "show"], capture_output=True, text=True).stdout
+        except OSError:
+            out = ""
+        used |= {int(m, 0) for m in re.findall(r"fwmark (0x[0-9a-fA-F]+|\d+)", out)}
+        used |= {int(t) for t in re.findall(r"lookup (\d+)", out)}
+    mark = 51820
+    while mark in used:
+        mark += 1
+    return mark
+
+def carry_only(c):
+    # Makes a copy route nothing but what's added after: no routes of its
+    # own or from its server, no default route, no DNS. Its routes go in the
+    # main table, even if it has a table of its own: that's the table the
+    # chain's packets are looked up in, so a route anywhere else would be
+    # passed over, and the next server reached around this tunnel instead.
+    if kind(c) == "wg":
+        w = c.get_setting(NM.SettingWireGuard)
+        w.props.peer_routes = False
+        w.props.ip4_auto_default_route = NM.Ternary.FALSE
+        w.props.ip6_auto_default_route = NM.Ternary.FALSE
+    for ip in (c.get_setting_ip4_config(), c.get_setting_ip6_config()):
+        if ip is not None:
+            ip.props.never_default = True
+            if kind(c) == "ovpn":
+                ip.props.ignore_auto_routes = True
+                ip.props.ignore_auto_dns = True
+            ip.props.route_table = 0
+            ip.clear_routes()
+            ip.clear_routing_rules()
+            ip.clear_dns()
+            ip.clear_dns_searches()
+
+def carrier_mtu(c):
+    if kind(c) == "wg":
+        return c.get_setting(NM.SettingWireGuard).get_mtu() or PLAIN_MTU
+    return OVPN_CARRY_MTU
+
+def why_unusable(servers, addr, name, carrier, carrier_name):
+    # Why addr can't be name's server inside carrier, or None, then noting
+    # it down as name's.
+    if servers.get(addr, name) != name:
+        return "%s and %s use the same server (%s), so one can't go through the other." % (servers[addr], name, addr)
+    why = why_not_carried(carrier, carrier_name, addr)
+    if why:
+        return "%s can't carry %s: %s's server (%s) isn't reachable through it (%s)." % (carrier_name, name, name, addr, why)
+    servers[addr] = name
+    return None
+
+def check_server(servers, addr, name, carrier, carrier_name):
+    why = why_unusable(servers, addr, name, carrier, carrier_name)
+    if why:
+        raise ValueError(why)
+
+def hop_copy(p, i, n):
+    # A copy of profile p, for place i of n in a chain. Raises ValueError
+    # when p can't connect with nobody there to type anything.
+    name = p.get_id()
+    if kind(p) == "wg":
+        if not load_keys(p):
+            raise ValueError("NetworkManager doesn't store %s's keys, so it can't be in a group." % name)
+    else:
+        why = unready(p)
+        if why:
+            raise ValueError("%s %s, so it can't be in a group." % (name, why))
+    c = NM.SimpleConnection.new_clone(p)
+    s = c.get_setting_connection()
+    s.props.uuid = NM.utils_uuid_generate()
+    s.props.id = "%s (%d/%d)" % (name, i + 1, n)
+    s.props.autoconnect = False
+    u = NM.SettingUser.new()  # in place of the profile's own
+    u.set_data(OF, p.get_uuid())
+    u.set_data(HOP, "%d/%d" % (i + 1, n))
+    c.add_setting(u)
+    return c
+
+def chain_copies(path):
+    # The chain's profiles as they'll connect in it, as far as that's known
+    # before any is up. For each but the last, also where to poke it once
+    # it's up, and the DNS servers it routes, to look the next server's
+    # name up with (empty when the next server is given as an address).
+    # Raises ValueError when the chain can't work.
+    import socket
+    mark = chain_mark(path)
+    copies, pokes, dns, servers = [], [], [], {}
+    taken = set(os.listdir("/sys/class/net")) if os.path.isdir("/sys/class/net") else set()
+    for i, p in enumerate(path):
+        name = p.get_id()
+        c = hop_copy(p, i, len(path))
+        if kind(p) == "wg":
+            c.get_setting(NM.SettingWireGuard).props.fwmark = mark
+            # Its own interface, apart from the others' and anything up.
+            s = c.get_setting_connection()
+            iface = s.get_interface_name() or "wg"
+            if iface in taken:
+                iface = next(n for n in ("%s-%d" % (iface[:11], k) for k in range(2, 100)) if n not in taken)
+                s.props.interface_name = iface
+            taken.add(iface)
+        elif i:
+            for ip in (c.get_setting_ip4_config(), c.get_setting_ip6_config()):
+                if ip is not None:
+                    ip.props.route_metric = OVPN_INNER_METRIC
+        if kind(p) == "ovpn" and i == len(path) - 1:
+            own_table(c, table_of(p))
+        ends = servers_of(c)
+        if not ends:
+            raise ValueError("%s has no server address." % name)
+        if i == 0:
+            # Reached directly, so it's looked up the usual way. Its
+            # addresses here only catch a later hop on the same server.
+            for host, port in ends:
+                a = literal(host)
+                try:
+                    found = [a] if a else [literal(f[4][0]) for f in socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM)]
+                except (OSError, UnicodeError):
+                    found = []  # NetworkManager will say
+                for a in found:
+                    servers.setdefault(a, name)
+            copies.append(c)
+            continue
+        carrier, carrier_name = copies[-1], path[i - 1].get_id()
+        carry_only(carrier)
+        if kind(carrier) == "wg" and not families(carrier):
+            raise ValueError("%s has no tunnel address, so it can't carry %s." % (carrier_name, name))
+        if proxy_of(p):
+            raise ValueError("%s uses a proxy (%s) that can't be routed through %s. "
+                             "It can only be first in a group." % (name, proxy_of(p)[0], carrier_name))
+        poke, names, skipped = None, [], ""
+        for host, port in ends:
+            a = literal(host)
+            if a is None:
+                names.append(host)
+                continue
+            if kind(p) == "ovpn":
+                # Any of an OpenVPN profile's servers will do: one that
+                # can't be reached through the one before is left out.
+                why = why_unusable(servers, a, name, carrier, carrier_name)
+                if why:
+                    skipped = why
+                    continue
+            else:
+                check_server(servers, a, name, carrier, carrier_name)
+            add_route(carrier, a)
+            poke = poke or (str(a), port)
+        found = []
+        if names and kind(carrier) != "wg" and not (kind(p) == "ovpn" and poke):
+            raise ValueError(
+                "%s's server is a hostname (%s), which can't be routed through %s (OpenVPN). "
+                "Use server IP address in %s." % (
+                    name, names[0], carrier_name, name))
+        if kind(p) == "ovpn" and not poke and not (names and kind(carrier) == "wg"):
+            raise ValueError(skipped or "%s has no server reachable through %s." % (name, carrier_name))
+        if names and kind(carrier) == "wg":
+            found = tunnel_dns(path[i - 1], carrier)
+            if not found and poke:
+                # Its servers given as addresses will do.
+                set_remotes(c, [r for r in remotes(c) if literal(r[0]) is not None])
+                names = []
+        if names and kind(carrier) == "wg":
+            if not found:
+                raise ValueError(
+                    "%s's server is a hostname (%s), and %s has no DNS server to look it up. "
+                    "Use server IP address in %s, or add a DNS server inside %s's AllowedIPs." % (
+                        name, names[0], carrier_name, name, carrier_name))
+            for a in found:
+                add_route(carrier, a)
+            poke = poke or (str(found[0]), 53)
+        pokes.append(poke)
+        dns.append(found)
+        copies.append(c)
+    return copies, pokes, dns, servers
+
+def place_hop(nm, copies, path, i, dns, servers):
+    # Once the tunnel before it is up: looks hop i's servers up through it
+    # where they're names, points hop i at them, and has the tunnel before
+    # route those and nothing else. Returns the servers' addresses.
+    copy, carrier = copies[i], copies[i - 1]
+    name, carrier_name = path[i].get_id(), path[i - 1].get_id()
+
+    def resolve(host):
+        # The address host stands for, looked up through the carrier; None
+        # for a name behind an OpenVPN carrier, which can't be routed.
+        a = literal(host)
+        if a is not None or kind(carrier) != "wg":
+            return a
+        try:
+            found = lookup(host, dns[i - 1], families(carrier))
+        except ValueError as e:
+            raise ValueError("%s: couldn't look up server %s through %s (%s)." % (name, host, carrier_name, e))
+        return next((f for f in found if why_not_carried(carrier, carrier_name, f) is None), found[0])
+
+    placed, overhead = [], 60
+    if kind(copy) == "wg":
+        w = copy.get_setting(NM.SettingWireGuard)
+        new_peers = []
+        for q in peers(copy):
+            q = q.new_clone(True)
+            if q.get_endpoint():
+                host, port = split_endpoint(q.get_endpoint())
+                a = resolve(host)
+                check_server(servers, a, name, carrier, carrier_name)
+                v6 = a.version == 6
+                q.set_endpoint(("[%s]:%s" if v6 else "%s:%s") % (a, port), True)
+                overhead = max(overhead, 80 if v6 else 60)
+                placed.append(a)
+            q.seal()
+            new_peers.append(q)
+        w.clear_peers()
+        for q in new_peers:
+            w.append_peer(q)
+        # Each tunnel inside another loses room for the outer one's headers:
+        # 60 bytes, or 80 over IPv6.
+        mtu = min(w.get_mtu() or PLAIN_MTU, carrier_mtu(carrier) - overhead)
+        ip6 = copy.get_setting_ip6_config()
+        if mtu < 1280 and ip6 is not None and ip6.get_num_addresses() > 0:
+            raise ValueError("Too many hops for IPv6: inside other hops, %s has room for %d-byte packets; IPv6 needs 1280." % (name, mtu))
+        w.props.mtu = mtu
+    else:
+        # Any of an OpenVPN profile's servers will do: those that can't be
+        # looked up, or reached through the one before, are left out.
+        items, why = [], ""
+        for host, port, proto in remotes(copy):
+            try:
+                a = resolve(host)
+            except ValueError as e:
+                why = str(e)
+                continue
+            if a is None:
+                continue
+            unusable = why_unusable(servers, a, name, carrier, carrier_name)
+            if unusable:
+                why = unusable
+                continue
+            placed.append(a)
+            items.append((str(a), port, proto))
+        if not items:
+            raise ValueError(why or "%s has no server reachable through %s." % (name, carrier_name))
+        set_remotes(copy, items)
+        # Its packets, with their own headers, fit inside the tunnel before.
+        copy.get_setting_vpn().add_data_item("mssfix", str(carrier_mtu(carrier) - 48))
+    if kind(carrier) != "wg":
+        return placed  # routed from the start: its servers were given as addresses
+    before = route_dests(carrier)
+    for ip in (carrier.get_setting_ip4_config(), carrier.get_setting_ip6_config()):
+        if ip is not None:
+            ip.clear_routes()
+    for a in placed:
+        add_route(carrier, a)
+    if route_dests(carrier) != before:
+        dev = nm.get_device_by_iface(carrier.get_interface_name())
+        if dev is None:
+            raise ValueError("%s dropped before %s could connect through it." % (carrier_name, name))
+        try:
+            wait(lambda cb: dev.reapply_async(carrier, 0, 0, None, cb, None), dev.reapply_finish)
+        except GLib.Error as e:
+            raise ValueError("%s: NetworkManager couldn't route server through %s: %s" % (name, carrier_name, e.message))
+    return placed
+
+# --- Kill switch ---
+#
+# Without root there's no firewall to change, but NetworkManager sets up
+# routing rules for any connection it runs. The kill switch is a dummy
+# interface whose rules send every unmarked packet to a table holding only
+# an "unreachable" route, unless the main table has a route for it more
+# specific than the default one (your local network, say). WireGuard's own
+# packets are marked, so they still go out. A full tunnel's rules come
+# first, so while one is up, traffic goes into it as usual; once it's gone,
+# nothing falls back to the default route.
+#
+# The servers of what's connected, or connecting, directly (a chain's
+# first) are let through, since OpenVPN's own packets aren't marked: it
+# couldn't reach its server otherwise. A chain also gets a blackhole route
+# to each server after the first, below the route through the tunnel before
+# it: if that tunnel goes, the next server isn't reached directly instead,
+# so it never sees your address.
+
+KILL_IFACE = "vpn-killswitch"
+KILL_NAME = "VPN kill switch"
+KILL_TABLE = 51819
+KILL_PRIORITY = 32760  # after the tunnels' rules, before the main table's
+KILL_METRIC = 9000     # below the routes through a chain's tunnels
+
+def kill_switch(nm):
+    return next((c for c in nm.get_connections()
+                 if c.get_connection_type() == "dummy" and c.get_interface_name() == KILL_IFACE), None)
+
+def kill_settings(uuid, iface, holes, allow):
+    import socket
+    c = NM.SimpleConnection.new()
+    s = NM.SettingConnection.new()
+    s.props.id = KILL_NAME
+    s.props.uuid = uuid
+    s.props.type = "dummy"
+    s.props.interface_name = iface
+    s.props.autoconnect = True  # from startup, so nothing gets out before a tunnel is up
+    c.add_setting(s)
+    c.add_setting(NM.SettingDummy.new())
+    for setting, fam, address, everything, bits in ((NM.SettingIP4Config, socket.AF_INET, "169.254.251.1", "0.0.0.0", 32),
+                                                    (NM.SettingIP6Config, socket.AF_INET6, "fd5b:6b77:6731::1", "::", 128)):
+        ip = setting.new()
+        ip.props.method = "manual"
+        ip.add_address(NM.IPAddress.new(fam, address, bits))
+        ip.props.never_default = True
+        block = NM.IPRoute.new(fam, everything, 0, None, -1)
+        block.set_attribute("type", GLib.Variant("s", "unreachable"))
+        block.set_attribute("table", GLib.Variant("u", KILL_TABLE))
+        ip.add_route(block)
+        mine = [a for a in holes if (":" in a) == (fam == socket.AF_INET6)]
+        for addr in mine:
+            hole = NM.IPRoute.new(fam, addr, bits, None, KILL_METRIC)
+            hole.set_attribute("type", GLib.Variant("s", "blackhole"))
+            ip.add_route(hole)
+        rules = [(KILL_PRIORITY, 254, 0, None), (KILL_PRIORITY + 1, KILL_TABLE, -1, None)]
+        rules += [(KILL_PRIORITY - 1, 254, -1, a) for a in allow if (":" in a) == (fam == socket.AF_INET6)]
+        for priority, table, suppress, to in rules:
+            rule = NM.IPRoutingRule.new(fam)
+            rule.set_priority(priority)
+            rule.set_fwmark(0, 0xffffffff)  # unmarked packets only
+            if to:
+                rule.set_to(to, bits)
+            rule.set_table(table)
+            if suppress >= 0:
+                rule.set_suppress_prefixlength(suppress)
+            rule.validate()
+            ip.add_routing_rule(rule)
+        c.add_setting(ip)
+    return c
+
+def kill_state(c):
+    # The servers the kill switch blackholes, and those it lets through.
+    holes, allow = [], []
+    for ip in (c.get_setting_ip4_config(), c.get_setting_ip6_config()):
+        for i in range(ip.get_num_routes() if ip else 0):
+            r = ip.get_route(i)
+            t = r.get_attribute("type")
+            if t is not None and t.get_string() == "blackhole":
+                holes.append(r.get_dest())
+        for i in range(ip.get_num_routing_rules() if ip else 0):
+            r = ip.get_routing_rule(i)
+            if r.get_priority() == KILL_PRIORITY - 1 and r.get_to():
+                allow.append(r.get_to())
+    return addresses(holes), addresses(allow)
+
+def addresses(hosts):
+    # The addresses among hosts, each written the one way.
+    return sorted({str(literal(h)) for h in hosts if literal(h) is not None})
+
+def set_kill(nm, holes, allow):
+    # Puts the kill switch's blackholes and exceptions on these servers,
+    # saved and applied. Raises ValueError when NetworkManager won't.
+    c = kill_switch(nm)
+    holes, allow = addresses(holes), addresses(allow)
+    if c is None or kill_state(c) == (holes, allow):
+        return
+    new = kill_settings(c.get_uuid(), c.get_interface_name(), holes, allow)
+    try:
+        wait(lambda cb: c.update2(new.to_dbus(NM.ConnectionSerializationFlags.ALL),
+                                  NM.SettingsUpdate2Flags.TO_DISK, None, None, cb, None), c.update2_finish)
+        dev = nm.get_device_by_iface(c.get_interface_name())
+        if dev is not None and dev.get_active_connection() is not None:
+            wait(lambda cb: dev.reapply_async(new, 0, 0, None, cb, None), dev.reapply_finish)
+    except GLib.Error as e:
+        raise ValueError("NetworkManager couldn't update kill switch: " + e.message)
+
+def chain_holes(nm):
+    # The servers of the chain that's up, behind its first.
+    return [h for a in chain_up(nm)[1:] for h, _ in servers_of(a.get_connection()) if literal(h)]
+
+def addresses_of(c, strict=True):
+    # The addresses of what c contacts directly: its servers, and its proxy.
+    # Names are looked up here, all at once; those that can't be are left
+    # out. With strict (the kill switch is on, and nothing gets through to a
+    # DNS server until a VPN is connected), raises ValueError when nothing's
+    # left of them.
+    import socket, threading, time
+    out, names, found = [], [], []
+    for host, port in contacted(c):
+        a = literal(host)
+        if a is not None:
+            out.append(str(a))
+        else:
+            names.append((host, port))
+
+    def look(host, port):
+        try:
+            found.extend(f[4][0] for f in socket.getaddrinfo(host, port, type=socket.SOCK_DGRAM))
+        except (OSError, UnicodeError):
+            pass
+    # In threads: a lookup nothing answers takes a while to give up.
+    threads = [threading.Thread(target=look, args=n, daemon=True) for n in names]
+    for t in threads:
+        t.start()
+    end = time.monotonic() + 8
+    for t in threads:
+        t.join(max(0, end - time.monotonic()))
+    out = addresses(out + found)
+    if strict and names and not out:
+        raise ValueError("Couldn't look up %s's server (%s): kill switch blocks DNS until a VPN is connected. "
+                         "Use server IP address, or turn off kill switch to connect." % (c.get_id(), names[0][0]))
+    return out
+
+# The addresses looked up for what's connected (a profile, or a chain's
+# first copy), by the uuid of the connection, so the kill switch goes on
+# letting them through: kept while it's connected, and for a while after a
+# connect begins (another process may still be connecting it), unless
+# forgotten when it disconnects or fails to.
+SERVERS = "omarchy-vpn-manager-servers"
+CONNECTING_GRACE = 90
+
+def looked_up():
+    out = {}
+    try:
+        with open(runtime_file(SERVERS)) as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 3 and parts[0]:
+                    out[parts[0]] = (float(parts[1] or 0), parts[2].split())
+    except (OSError, TypeError, ValueError):
+        pass
+    return out
+
+def allowed(nm, add=None, forget=()):
+    # What the kill switch lets through: what's connected directly (a
+    # chain's first included) sends to, a WireGuard profile NetworkManager
+    # connects on its own at startup, and what's in add: the addresses
+    # looked up for a connection (by uuid) that's about to connect, or is
+    # connected. Those just disconnected (or not connected after all) are
+    # in forget. Call under state_change().
+    import time
+    now = time.time()
+    active, out = set(), []
+    for a in vpn_active(nm):
+        c = a.get_connection()
+        hop = user_data(c, HOP)
+        if not hop or hop.startswith("1/"):
+            active.add(c.get_uuid())
+            out += [h for h, _ in contacted(c)]
+    for p, via, _ in tree(nm):
+        if kind(p) == "wg" and not via and p.get_setting_connection().get_autoconnect():
+            out += [h for h, _ in servers_of(p)]
+    keep = {u: (when, found) for u, (when, found) in looked_up().items()
+            if u not in forget and (u in active or now - when < CONNECTING_GRACE)}
+    for u, found in (add or {}).items():
+        keep[u] = (now, addresses(found))
+    write_state(SERVERS, "".join("%s\t%d\t%s\n" % (u, when, " ".join(found)) for u, (when, found) in sorted(keep.items())))
+    return addresses(out + [a for _, found in keep.values() for a in found])
+
+def sync_kill(nm, add=None, forget=(), holes=None):
+    # Blackholes on the servers of the chain that's up (or holes), and
+    # what's connected let through: nothing left over from what's gone,
+    # which would block a chain's server for good, or let one through for
+    # no reason. See allowed() for add and forget. Raises ValueError when
+    # NetworkManager won't change the kill switch.
+    with state_change():
+        allow = allowed(nm, add, forget)
+        if kill_switch(nm) is not None:
+            set_kill(nm, chain_holes(nm) if holes is None else holes, allow)
+
+def resync_kill(forget=()):
+    # After a disconnect or a failed connect, with what NetworkManager says now.
+    try:
+        sync_kill(client(), forget=forget)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+
+def cmd_sync_kill(args):
+    # sync-kill [--forget <uuid>]... [--for <uuid>]: after a disconnect, and
+    # around a reconnect made elsewhere (edit config): --for looks up the
+    # profile's servers for the kill switch to let through.
+    nm = client()
+    forget, add = set(), {}
+    for flag, uuid in zip(args[::2], args[1::2]):
+        if flag == "--forget":
+            forget.add(uuid)
+        elif flag == "--for":
+            c = find(nm, uuid)
+            try:
+                add[c.get_uuid()] = addresses_of(c, strict=kill_switch(nm) is not None)
+            except ValueError as e:
+                fail(str(e))
+    try:
+        sync_kill(nm, add, forget)
+    except ValueError as e:
+        fail(str(e))
+
+def cmd_killswitch(args):
+    # on: adds the kill switch and connects it; off: removes it. Waits for
+    # a connect the panel started by itself rather than stopping it.
+    if args not in (["on"], ["off"]):
+        fail("usage: killswitch on|off")
+    take_turn(False, stop_auto=False)
+    nm = client()
+    ks = kill_switch(nm)
+    if args == ["off"]:
+        if ks is not None:
+            try:
+                wait(lambda cb: ks.delete_async(None, cb, None), ks.delete_finish)
+            except GLib.Error as e:
+                if nm.get_connection_by_uuid(ks.get_uuid()) is not None:
+                    fail("NetworkManager couldn't remove kill switch: " + e.message)
+        if not settle(lambda: nm.get_device_by_iface(KILL_IFACE) is None
+                      or nm.get_device_by_iface(KILL_IFACE).get_active_connection() is None, 10):
+            fail("Kill switch is still turning off. Check again in a moment.")
+        return
+    # Servers given by name are looked up now, while that still works, so
+    # what's connected stays connected.
+    add, blocked = {}, []
+    known = looked_up()
+    for a in vpn_active(nm):
+        c = a.get_connection()
+        hop = user_data(c, HOP)
+        if hop and not hop.startswith("1/"):
+            continue
+        if c.get_uuid() not in known:
+            add[c.get_uuid()] = addresses_of(c, strict=False)
+        if not hop and kind(c) == "ovpn" and routing_state(c) == "none" and all_traffic(c):
+            blocked.append(c.get_id())
+    c = ks
+    with state_change():
+        new = kill_settings(c.get_uuid() if c else NM.utils_uuid_generate(), KILL_IFACE,
+                            chain_holes(nm), allowed(nm, add))
+    dev = nm.get_device_by_iface(KILL_IFACE)
+    try:
+        if c is None:
+            c = wait(lambda cb: nm.add_connection2(new.to_dbus(NM.ConnectionSerializationFlags.ALL),
+                                                   NM.SettingsAddConnection2Flags.TO_DISK, None, False, None, cb, None),
+                     nm.add_connection2_finish)
+            c = c[0] if isinstance(c, tuple) else c
+        else:
+            wait(lambda cb: c.update2(new.to_dbus(NM.ConnectionSerializationFlags.ALL),
+                                      NM.SettingsUpdate2Flags.TO_DISK, None, None, cb, None), c.update2_finish)
+        if dev is not None and dev.get_active_connection() is not None:
+            # Already on: changed in place, with no moment it's off.
+            wait(lambda cb: dev.reapply_async(new, 0, 0, None, cb, None), dev.reapply_finish)
+            a = dev.get_active_connection()
+        else:
+            a = wait(lambda cb: nm.activate_connection_async(c, None, None, None, cb, None), nm.activate_connection_finish)
+    except GLib.Error as e:
+        fail("NetworkManager couldn't turn on kill switch: " + e.message)
+    settle(lambda: a.get_state() in (NM.ActiveConnectionState.ACTIVATED, NM.ActiveConnectionState.DEACTIVATED), 15)
+    if a.get_state() != NM.ActiveConnectionState.ACTIVATED:
+        fail("NetworkManager couldn't turn on kill switch.")
+    # Set up elsewhere, so without the routing table it'd need: blocked
+    # until it's connected again from here, which asks first.
+    for name in blocked:
+        print("blocked\t" + field(name))
+
+# --- Connecting ---
+
+def reason_text(a):
+    reason = NM.ActiveConnectionStateReason(a.get_state_reason()).value_nick
+    return {"no-secrets": "required password not saved",
+            "login-failed": "username or password rejected",
+            "connect-timeout": "server didn't answer",
+            "service-start-timeout": "OpenVPN didn't start",
+            "service-start-failed": "OpenVPN didn't start",
+            "service-stopped": "OpenVPN stopped"}.get(reason, reason.replace("-", " "))
+
+def event(*fields):
+    # A line for the panel, which reads them as they come.
+    sys.stdout.write("\t".join(field(f) for f in fields) + "\n")
+    sys.stdout.flush()
+
+def connect_direct(nm, c, rest):
+    # A profile on its own. An OpenVPN one goes through `nmcli --ask`, for
+    # its questions; that can take a while, so other changes needn't wait.
+    import fcntl, signal, subprocess, time
+    uuid = c.get_uuid()
+    end_turn()
+    if kind(c) == "ovpn":
+        path = runtime_file("omarchy-vpn-manager-connect-%s.lock" % uuid)
+        if path:
+            lock = open(path, "a")
+            _turn.append(lock)  # this one stays for the whole connect
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                fail("Already connecting.")
+        try:
+            cmd_ovpn_up([uuid] + rest)
+        except SystemExit as e:
+            if e.code:
+                resync_kill(forget={uuid})  # its server needn't be let through any more
+            raise
+        return
+    try:
+        run = subprocess.Popen(["nmcli", "--wait", "30", "connection", "up", "uuid", uuid],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               env=dict(os.environ, LC_ALL="C"))
+    except OSError as e:
+        resync_kill(forget={uuid})
+        fail("nmcli didn't run: %s" % e)
+    while run.poll() is None:
+        if _stop:
+            # Cancelled: NetworkManager carries on without nmcli, so it's
+            # taken down too.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            run.terminate()
+            subprocess.run(["nmcli", "connection", "down", "uuid", uuid], capture_output=True)
+            hold(uuid, True)
+            resync_kill(forget={uuid})
+            print("Cancelled.", file=sys.stderr)
+            sys.exit(130)
+        time.sleep(0.1)
+    if run.returncode != 0:
+        import re
+        resync_kill(forget={uuid})
+        m = re.search(r"^Error: (Connection activation failed: )?(.*)$", run.stdout.read(), re.M)
+        fail(m.group(2) if m else "NetworkManager couldn't connect.")
+
+def cmd_connect(args):
+    # A profile in a group connects the whole group, as a chain; one that
+    # isn't connects on its own. Either way, what's in the way goes first:
+    # another chain, the group's own profiles connected on their own, and
+    # whatever's set to connect automatically. --auto: only what the panel
+    # connects automatically (a group, or an OpenVPN profile on its own),
+    # that you haven't disconnected, while nothing else is connected.
+    # --own-table: an OpenVPN profile set up elsewhere gets the routing
+    # table the kill switch needs to let it through (see own_table).
+    import signal
+    auto = args[:1] == ["--auto"]
+    args = args[1:] if auto else args
+    if not args:
+        fail("No profile given.")
+    own = "--own-table" in args
+    rest = [a for a in args[1:] if a != "--own-table"]
+    nm = client()
+    path = group_of(nm, find(nm, args[0]))
+    if auto and not auto_ready(path):
+        return
+    if not take_turn(auto, path[0].get_uuid()):
+        return  # another connect is under way
+    # From here on, a stop takes down what's been done so far.
+    signal.signal(signal.SIGTERM, on_stop)
+    del nm, path
+    try:
+        connect_turn(auto, args[0], rest, own)
+    except Cancelled:
+        # Stopped while what was in the way went: nothing of this one's up.
+        resync_kill()
+        print("Cancelled.", file=sys.stderr)
+        sys.exit(130)
+
+def auto_ready(path):
+    # Whether --auto connects this (a group, or a profile on its own).
+    return (panel_auto(path[0]) and (len(path) > 1) == (user_data(path[0], GROUP_AUTO) == "1")
+            and path[0].get_uuid() not in held())
+
+def connect_turn(auto, uuid, rest, own):
+    # Afresh, now that it's this one's turn: anything may have changed
+    # while it waited. Everything's checked, and the first server looked
+    # up, before anything's taken down.
+    import signal
+    nm = client()
+    c = find(nm, uuid)
+    path = group_of(nm, c)
+    want = [p.get_uuid() for p in path]
+    sweep_copies(nm)
+    if auto and (not auto_ready(path) or vpn_active(nm)):
+        return
+    killing = kill_switch(nm) is not None
+    up = chain_up(nm)
+    if len(path) == 1:
+        if any(a.get_uuid() == uuid and a.get_state() == NM.ActiveConnectionState.ACTIVATED for a in vpn_active(nm)):
+            return  # bringing it up again would drop the tunnel for a moment
+        if kind(c) == "ovpn" and routing_state(c) == "none" and killing and not own:
+            # Set up elsewhere: its routing isn't changed without asking.
+            event("consent", c.get_id())
+            print("Blocked by kill switch: %s was set up outside this plugin and has no routing table of its own. "
+                  "Connect with --own-table to add one; routing stays the same." % c.get_id(),
+                  file=sys.stderr)
+            sys.exit(3)
+        try:
+            first = addresses_of(c, strict=killing)
+        except ValueError as e:
+            fail(str(e))
+    else:
+        if [user_data(a.get_connection(), OF) for a in up] == want and all(
+                a.get_state() == NM.ActiveConnectionState.ACTIVATED for a in up):
+            return
+        try:
+            copies, pokes, dns, servers = chain_copies(path)
+            first = addresses_of(copies[0], strict=killing)
+        except ValueError as e:
+            fail(str(e))
+    if _stop:
+        sys.exit(130)  # nothing's changed yet
+    if not auto:
+        hold(want[0], False)
+        for a in auto_owners(nm):
+            if a.get_uuid() not in want:
+                put_aside(nm, a)
+    if len(path) == 1:
+        if any(user_data(a.get_connection(), OF) == uuid for a in up):
+            take_down(nm, up)
+            sweep_copies(nm)
+        if own:
+            ensure_own_table(nm, c)
+        try:
+            sync_kill(nm, add={uuid: first})
+        except ValueError as e:
+            fail(str(e))
+        connect_direct(nm, c, rest)
+        return
+    # Another group, taken down for this one: don't bring it straight back.
+    if up and user_data(up[0].get_connection(), OF) != want[0]:
+        hold(user_data(up[0].get_connection(), OF), True)
+    take_down(nm, up + [a for a in vpn_active(nm) if a.get_uuid() in want])
+    sweep_copies(nm)
+    connected, blocked = [], []
+
+    def give_up(msg, code=1):
+        # Nothing stops this: it'd leave a chain half up.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        _stop.clear()
+        take_down(nm, connected)
+        sweep_copies(nm)
+        resync_kill(forget={copies[0].get_uuid()})
+        print(msg, file=sys.stderr)
+        sys.exit(code)
+
+    try:
+        connect_chain(nm, path, copies, pokes, dns, servers, first, connected, blocked, give_up)
+        write_hops(nm)
+    except Cancelled:
+        hold(want[0], True)
+        give_up("Cancelled.", 130)
+
+def connect_chain(nm, path, copies, pokes, dns, servers, first, connected, blocked, give_up):
+    # One after another, each once it's been seen to work. NetworkManager
+    # calls an OpenVPN tunnel connected once its server has answered, but a
+    # WireGuard one as soon as it's set up, before any server has. So each
+    # WireGuard one is nudged into shaking hands with its server (through
+    # the tunnels before it), and the next waits until that server's answer
+    # has come in: a new tunnel has received nothing until then. (Reading
+    # handshakes directly needs root.)
+    done = (NM.ActiveConnectionState.ACTIVATED, NM.ActiveConnectionState.DEACTIVATED)
+    for i, (copy, p) in enumerate(zip(copies, path)):
+        if i:
+            try:
+                blocked += [str(a) for a in place_hop(nm, copies, path, i, dns, servers)]
+            except ValueError as e:
+                give_up(str(e))
+        # Before it connects, so its server is never reached around the
+        # tunnels before it (and the first one's isn't left blackholed by
+        # an earlier chain).
+        try:
+            sync_kill(nm, add={copies[0].get_uuid(): first}, holes=blocked)
+        except ValueError as e:
+            give_up(str(e))
+        # An OpenVPN copy inside a WireGuard one connects over it, so that
+        # NetworkManager's own route to its server goes through it too.
+        base = connected[-1] if i and kind(p) == "ovpn" and kind(path[i - 1]) == "wg" else None
+        try:
+            a = connect_copy(nm, copy, base)
+        except GLib.Error as e:
+            give_up("%s: NetworkManager couldn't connect: %s" % (p.get_id(), e.message))
+        connected.append(a)
+        settle(lambda: a.get_state() in done, 75 if kind(p) == "ovpn" else 30)
+        if a.get_state() != NM.ActiveConnectionState.ACTIVATED:
+            give_up("%s didn't connect%s (%s)." % (p.get_id(), " through " + path[i - 1].get_id() if i else "", reason_text(a)))
+        if kind(p) != "wg":
+            continue
+        iface = copy.get_interface_name()
+        target = pokes[i] if i + 1 < len(copies) else poke_target(copy)
+        if target is None and i + 1 == len(copies):
+            continue  # it routes nothing itself, so there's nothing to nudge it with
+        # WireGuard tries again every 5 seconds: three tries.
+        answered = False
+        for _ in range(8):
+            if target:
+                poke(*target)
+            if settle(lambda: rx_bytes(iface) > 0, 2):
+                answered = True
+                break
+        if not answered:
+            give_up("No answer from %s's server%s. Check that server is up." % (
+                p.get_id(), " through " + path[i - 1].get_id() if i else ""))
+
+def cmd_disconnect(args):
+    # Takes down the chain the profile's in, all of it. For one that isn't
+    # in a chain, prints "direct": the caller disconnects it as usual.
+    # Either way, it isn't connected automatically again until you connect
+    # it. Without a profile, takes down any chain, and nothing set to
+    # connect automatically comes straight back.
+    nm = client()
+    if args and not any(user_data(a.get_connection(), OF) == args[0] for a in chain_up(nm)):
+        hold(args[0], True)
+        # Nothing to wait for, unless the panel's connecting it by itself.
+        if auto_running() == args[0]:
+            take_turn(False)
+        print("direct")
+        return
+    take_turn(False)
+    nm = client()
+    sweep_copies(nm)
+    up = chain_up(nm)
+    if up:
+        hold(user_data(up[0].get_connection(), OF), True)
+    if not args:
+        for a in auto_owners(nm):
+            if panel_auto(a):
+                hold(a.get_uuid(), True)
+    gone = take_down(nm, up)
+    sweep_copies(nm)
+    write_hops(nm)
+    # With the turn, no chain is connecting: what's noted for a copy that's
+    # gone (cut short some other way) can go too.
+    resync_kill(forget={a.get_uuid() for a in up} | {u for u in looked_up() if nm.get_connection_by_uuid(u) is None})
+    if not gone:
+        fail("NetworkManager is still disconnecting.")
+
+def hop_lines(nm, uuids):
+    # For each connection named that's part of a chain: its uuid, its
+    # profile's uuid and name, and its place in the chain.
+    out = ""
+    for uuid in uuids:
+        c = nm.get_connection_by_uuid(uuid)
+        if c is None or not is_copy(c):
+            continue
+        p = nm.get_connection_by_uuid(user_data(c, OF))
+        out += "\t".join(field(f) for f in (uuid, user_data(c, OF), p.get_id() if p else c.get_id(), user_data(c, HOP))) + "\n"
+    return out
+
+def write_hops(nm):
+    # For status, which reads them here rather than starting this helper
+    # every time it's asked.
+    with state_change():
+        write_state("omarchy-vpn-manager-hops", hop_lines(nm, [a.get_uuid() for a in chain_up(nm)]))
+
+def cmd_hops(args):
+    sys.stdout.write(hop_lines(client(), args))
+
+# --- Connecting an OpenVPN profile on its own ---
+#
+# Through `nmcli --ask connection up` on a pseudo-terminal, which asks for
+# whatever NetworkManager needs: the password (typed in from the panel's
+# form), or a question for the panel (a key's password, a one-time code).
+
+# What openvpn's log lines mean while a connection is coming up.
+# NetworkManager only ever says "the VPN service stopped" or "timed out",
+# and openvpn retries most problems until then, so the log is where the real
+# reason is. Each rule: needle, fatal (stop trying now), message while
+# trying, message on failure.
+LOG_RULES = [
+    ("private-key-password-failure", True, None, "Wrong private key password."),
+    ("Options error:", True, None, None),
+    ("VERIFY ERROR", True, None, "Server's certificate couldn't be verified."),
+    ("certificate verify failed", True, None, "Server's certificate couldn't be verified."),
+    ("AUTH_FAILED", False, None, "Server rejected username or password."),
+    ("Cannot resolve host address", False, "Can't find server. Retrying…",
+     "Couldn't find server. Check the address or your internet connection."),
+    ("RESOLVE: Cannot resolve", False, "Can't find server. Retrying…",
+     "Couldn't find server. Check the address or your internet connection."),
+    ("TLS key negotiation failed", False, "No answer from server. Retrying…",
+     "Server didn't answer. Check the address and port, or your internet connection."),
+    ("TLS handshake failed", False, "No answer from server. Retrying…",
+     "Server didn't answer. Check the address and port, or your internet connection."),
+    ("Connection refused", False, "Server refused the connection. Retrying…",
+     "Server refused the connection."),
+]
+
+def read_log(line):
+    for needle, fatal, progress, final in LOG_RULES:
+        if needle in line:
+            if final is None:
+                final = line.split(needle, 1)[1].strip() or line
+            return fatal, progress, final
+    return None
+
+# Questions whose answer the panel masks: passwords, and anything it can't
+# tell. nmcli turns the terminal's echo off for every question, so that
+# can't say; a one-time code shows as it's typed.
+SECRET_KEYS = ("password", "cert-pass", "http-proxy-password")
+
+def openvpn_owner(pid):
+    # The profile an openvpn process runs: NetworkManager names its
+    # management socket after the connection's uuid. None for anything
+    # else, or gone.
+    import re
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            argv = f.read().split(b"\0")
+    except OSError:
+        return None
+    if not argv or os.path.basename(argv[0]) != b"openvpn":
+        return None
+    for a in argv:
+        m = re.search(rb"nm-openvpn-([0-9a-f-]{36})", a)
+        if m:
+            return m.group(1).decode()
+    return None
+
+def cmd_ovpn_up(args):
+    import fcntl, pty, re, select, signal, struct, termios, time
+    if not args:
+        fail("No profile given.")
+    uuid, rest = args[0], args[1:]
+    user = mode = None
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--user" and i + 1 < len(rest):
+            user = rest[i + 1]
+            i += 1
+        elif a in ("--save", "--ask"):
+            mode = a[2:]
+        i += 1
+    # On stdin: the username (--user-stdin), then the password, then the
+    # answers to whatever is asked while connecting.
+    if "--user-stdin" in rest:
+        user = read_line()
+    password = read_line() if "--password-stdin" in rest else None
+
+    def emit(*fields):
+        sys.stdout.write("\t".join(field(f) for f in fields) + "\n")
+        sys.stdout.flush()
+
+    nm = client()
+    c = find(nm, uuid)
+    if kind(c) != "ovpn":
+        fail("Not an OpenVPN profile.")
+    # Work out what the profile will hold from what it holds now plus the
+    # changes asked for, and check it all before saving anything.
+    s = c.get_setting_vpn()
+    uses_password = s.get_data_item("connection-type") in PASSWORD_TYPES
+    password_flags = flags(s, "password-flags")
+    if uses_password:
+        username = (user if user is not None else s.get_data_item("username") or "").strip()
+        if not username:
+            fail("Enter username.")
+        if "\t" in username or "\n" in username:
+            fail("Username can't contain tabs or line breaks.")
+        if mode is not None:
+            password_flags = 0 if mode == "save" else 2
+        if password is None and password_flags == 0 and not saved_password(c):
+            fail("Enter password.")
+        if user is not None or mode is not None:
+            out = NM.SimpleConnection.new_clone(c)
+            os_ = out.get_setting_vpn()
+            os_.add_data_item("username", username)
+            if mode == "ask":
+                os_.add_data_item("password-flags", "2")
+                os_.remove_secret("password")
+            elif mode == "save":
+                os_.add_data_item("password-flags", "0")
+                if password:
+                    os_.add_secret("password", password)
+            save(nm, c, out)
+    # NetworkManager asks again for a password it doesn't keep; a refused
+    # saved password (or certificate) just stalls, so that's the end of it.
+    reprompts = uses_password and password_flags != 0
+    del nm, c, s
+
+    import json, subprocess
+    try:
+        journal = subprocess.Popen(["journalctl", "-f", "-q", "-n", "0", "-o", "json",
+                                    "--output-fields=MESSAGE,_PID", "SYSLOG_IDENTIFIER=nm-openvpn"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        journal = None
+    log_fd = journal.stdout.fileno() if journal else None
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ.update(LC_ALL="C", TERM="dumb")
+        # Wide, so readline never scrolls a long prompt sideways.
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 4000, 0, 0))
+        try:
+            os.execvp("nmcli", ["nmcli", "--ask", "--wait", "90", "connection", "up", "uuid", uuid])
+        finally:
+            os._exit(127)
+
+    def stop(*_, code=130):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        if journal:
+            journal.kill()
+        sys.exit(code)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    stdin_buf = b""
+    answers = []
+    stdin_open = True
+    partial = ""
+    context = []
+    waiting = False
+    drop_echo = None
+    last_data = time.time()
+    error = None
+    asked = set()
+    log_buf = b""
+    log_final = None
+    shown = set()
+    owners = {}  # pid → the profile its openvpn runs, so other VPNs' logs are skipped
+
+    def ours(entry):
+        try:
+            pid_ = int(entry.get("_PID", 0))
+        except (TypeError, ValueError):
+            return True
+        if pid_ not in owners:
+            owners[pid_] = openvpn_owner(pid_)
+        # Unknown (already exited, say, after an options error) counts as ours.
+        return owners[pid_] in (None, uuid)
+
+    def log_message(raw):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            return None
+        if not ours(entry):
+            return None
+        msg = entry.get("MESSAGE")
+        if isinstance(msg, list):  # journald sends non-UTF-8 text as bytes
+            msg = bytes(msg).decode(errors="replace")
+        return msg if isinstance(msg, str) else None
+
+    def handle_line(line):
+        nonlocal drop_echo, error
+        line = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", line).strip()
+        if not line or set(line) == {"*"}:
+            return  # blank, or the stars nmcli prints for a hidden answer
+        if drop_echo is not None and line == drop_echo:
+            drop_echo = None
+            return
+        drop_echo = None
+        if line.startswith("Connection successfully activated"):
+            emit("status", "Connected")
+        elif line.startswith("Error: "):
+            error = re.sub(r"^Error: (Connection activation failed: )?", "", line).rstrip(".")
+        elif line.startswith(("Hint: ", "Warning: ", "You need to authenticate")):
+            pass
+        else:
+            context.append(line)
+            del context[:-6]
+
+    def answer(text):
+        nonlocal drop_echo
+        os.write(fd, text.encode() + b"\r")
+        drop_echo = text  # nmcli may print the answer back
+
+    emit("status", "Connecting")
+    while True:
+        fds = [fd] + ([0] if stdin_open else []) + ([log_fd] if log_fd is not None else [])
+        ready, _, _ = select.select(fds, [], [], 0.15)
+        if log_fd is not None and log_fd in ready:
+            chunk = os.read(log_fd, 4096)
+            if not chunk:
+                log_fd = None
+            log_buf += chunk
+            while b"\n" in log_buf:
+                line, _, log_buf = log_buf.partition(b"\n")
+                text = log_message(line)
+                meaning = read_log(text) if text else None
+                if not meaning:
+                    continue
+                fatal, progress, log_final = meaning
+                if fatal or ("AUTH_FAILED" in text and not reprompts):
+                    # openvpn would keep retrying until NetworkManager gives up.
+                    emit("error", log_final)
+                    try:
+                        subprocess.run(["nmcli", "connection", "down", "uuid", uuid],
+                                       capture_output=True, timeout=20)
+                    except subprocess.TimeoutExpired:
+                        pass  # stopping nmcli below ends it anyway
+                    stop(code=1)
+                if progress and progress not in shown:
+                    shown.add(progress)
+                    emit("info", progress)
+        if 0 in ready:
+            chunk = os.read(0, 4096)
+            if not chunk:
+                stdin_open = False
+                if waiting:
+                    stop()  # the panel went away mid-question: cancel
+            else:
+                stdin_buf += chunk
+                while b"\n" in stdin_buf:
+                    line, _, stdin_buf = stdin_buf.partition(b"\n")
+                    answers.append(line.decode(errors="replace"))
+        if fd in ready:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            last_data = time.time()
+            partial += data.decode(errors="replace").replace("\r", "")
+            *lines, partial = partial.split("\n")
+            for line in lines:
+                handle_line(line)
+            continue
+        # Quiet now. Unfinished output ending in ":" is a prompt, such as
+        # "Password (vpn.secrets.password): ".
+        prompt = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", partial).strip()
+        if prompt.endswith(":") and not waiting:
+            if time.time() - last_data < 0.3:
+                continue  # more of it may be on its way
+            m = re.search(r"\s*\(vpn\.secrets\.([^()]+)\)\s*:$", prompt)
+            key = m.group(1) if m else ""
+            secret = not key or key in SECRET_KEYS
+            label = prompt[:m.start()] if m else prompt[:-1]
+            partial = ""
+            if key == "password" and password is not None and key not in asked:
+                answer(password)
+            else:
+                # Asked again means the last answer was refused.
+                note = "Server didn't accept that. " if key in asked else ""
+                if not stdin_open:
+                    # Nobody to answer it: connecting automatically, say.
+                    emit("error", "Server asked for %s with no one to answer. Connect from VPN panel."
+                         % (label.strip() or "an answer").lower())
+                    stop(code=1)
+                emit("prompt", "1" if secret else "0", label.strip() or "Answer",
+                     note + " / ".join(context))
+                waiting = True
+            asked.add(key)
+            context.clear()
+        if waiting and answers:
+            answer(answers.pop(0))
+            waiting = False
+            log_final = None  # a fresh answer: the last attempt's failure no longer applies
+
+    _, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status) if os.WIFEXITED(status) else 1
+    if journal:
+        journal.kill()
+    if code == 0:
+        emit("done")
+    elif not log_final and error and re.search(r"disconnected by (the )?user", error, re.I):
+        # Stopped from outside (nmcli, another app) while connecting: a
+        # cancel, reported like the panel's own.
+        emit("info", "Cancelled.")
+        sys.exit(130)
+    else:
+        emit("error", log_final or error or "NetworkManager couldn't connect.")
+    sys.exit(code)
+
+def cmd_browse(args):
+    from gi.repository import Gio
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    token = "omarchy_vpn_manager_%d" % os.getpid()
+    sender = bus.get_unique_name()[1:].replace(".", "_")
+    request = "/org/freedesktop/portal/desktop/request/%s/%s" % (sender, token)
+    loop = GLib.MainLoop()
+    result = {"uris": []}
+
+    def on_response(_conn, _sender, _path, _iface, _signal, params):
+        code, results = params.unpack()
+        if code == 0:
+            result["uris"] = results.get("uris", [])
+        loop.quit()
+
+    # Subscribe before asking, so a quick answer can't be missed.
+    bus.signal_subscribe("org.freedesktop.portal.Desktop", "org.freedesktop.portal.Request",
+                         "Response", request, None, Gio.DBusSignalFlags.NO_MATCH_RULE, on_response)
+    bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch",
+                  GLib.Variant("(s)", ("type='signal',interface='org.freedesktop.portal.Request',path='%s'" % request,)),
+                  None, Gio.DBusCallFlags.NONE, -1, None)
+    folder = os.path.expanduser(args[0]) if args else os.path.expanduser("~/Downloads")
+    options = {
+        "handle_token": GLib.Variant("s", token),
+        "multiple": GLib.Variant("b", True),
+        "modal": GLib.Variant("b", True),
+        "filters": GLib.Variant("a(sa(us))", [
+            ("VPN profiles", [(0, "*.conf"), (0, "*.CONF"), (0, "*.ovpn"), (0, "*.OVPN")]),
+            ("All files", [(0, "*")])]),
+    }
+    if os.path.isdir(folder):
+        options["current_folder"] = GLib.Variant("ay", folder.encode() + b"\0")
+    try:
+        bus.call_sync("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                      "org.freedesktop.portal.FileChooser", "OpenFile",
+                      GLib.Variant("(ssa{sv})", ("", "Import VPN profiles", options)),
+                      GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, -1, None)
+    except GLib.Error as e:
+        fail("File chooser didn't open: " + e.message)
+    GLib.timeout_add_seconds(900, loop.quit)
+    loop.run()
+    for uri in result["uris"]:
+        path = Gio.File.new_for_uri(uri).get_path()
+        if path:
+            print(path)
+
+COMMANDS = {"profiles": cmd_profiles, "import": cmd_import, "import-text": cmd_import_text,
+            "export": cmd_export, "apply": cmd_apply, "browse": cmd_browse, "move": cmd_move,
+            "group": cmd_group, "save": cmd_save, "remove": cmd_remove,
+            "connect": cmd_connect, "disconnect": cmd_disconnect, "hops": cmd_hops, "hold": cmd_hold,
+            "sync-kill": cmd_sync_kill,
+            "killswitch": cmd_killswitch}
+COMMANDS[sys.argv[1]](sys.argv[2:])
+PY
+
+# The helper is read on a file descriptor rather than passed with -c: a
+# single argument can't be longer than 128 KiB.
+py() { python3 -I /dev/fd/3 "$@" 3<<<"$HELPER"; }
+helper() { exec python3 -I /dev/fd/3 "$@" 3<<<"$HELPER"; }
+
+need_nm() {
+  local missing
+  missing=$(missing_from "${REQUIRED[@]}")
+  [[ -z $missing ]] || fail "Missing packages: $missing. Run setup to install."
+  nm_running || fail "NetworkManager isn't running."
+}
+
+# nmcli -t and -g escape ":" and "\" inside values.
+unescape() {
+  local v=${1//\\:/:}
+  printf '%s' "${v//\\\\/\\}"
+}
+
+# The first "Error: ..." line of nmcli's output, without the prefix.
+nm_error() {
+  local line
+  line=$(grep -m1 '^Error: ' <<<"$1")
+  line=${line#Error: }
+  line=${line#Connection activation failed: }
+  printf '%s' "${line:-$2}"
+}
+
+# Edit copies whose session was killed outright, so its EXIT trap never ran.
+# Each folder is named after its session's pid.
+sweep_edits() {
+  local d pid
+  [[ -d ${XDG_RUNTIME_DIR:-} ]] || return 0
+  for d in "$XDG_RUNTIME_DIR"/omarchy-vpn-manager-edit.*; do
+    [[ -d $d ]] || continue
+    pid=${d##*/omarchy-vpn-manager-edit.}
+    pid=${pid%%.*}
+    [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && continue
+    rm -rf -- "$d"
+  done
+}
+
+cmd_status() {
+  local missing active network line uuid type state dev file name ip secs sent recv now created copy place kind info addr
+  local killswitch=0 run=${XDG_RUNTIME_DIR:-}
+  local -a vpns=() in_memory=() unknown=()
+  local -A profile=() profile_name=() hop=() iface_of=()
+  sweep_edits
+  missing=$(missing_packages)
+  if ! installed; then
+    printf 'installed\t0\nmissing\t%s\n' "$missing"
+    return 0
+  fi
+  # It fails when NetworkManager isn't running.
+  if ! active=$(nmcli -t -f UUID,TYPE,STATE,DEVICE,FILENAME,NAME connection show --active 2>/dev/null); then
+    printf 'installed\t1\nmissing\t%s\nservice\tinactive\n' "$missing"
+    return 0
+  fi
+  network=$(nmcli -t -f STATE general 2>/dev/null)
+  while IFS= read -r line; do
+    # Escaped backslashes and colons out of the way, so the fields split.
+    line=${line//\\\\/$'\1'}
+    line=${line//\\:/$'\2'}
+    IFS=: read -r uuid type state dev file _ <<<"$line"
+    [[ $type == dummy && ($dev == vpn-killswitch || $dev == wg-killswitch) && $state == activated ]] && killswitch=1
+    [[ $type == wireguard || $type == vpn ]] || continue
+    vpns+=("$line")
+    # A chain connects copies of its profiles, which NetworkManager keeps in memory.
+    [[ $file == /run/* ]] && in_memory+=("$uuid")
+  done <<<"$active"
+  printf 'installed\t1\nmissing\t%s\nopenvpn\t%s\nservice\tactive\nnetwork\t%s\nkillswitch\t%s\n' \
+    "$missing" "$(openvpn_installed && echo 1 || echo 0)" "$network" "$killswitch"
+  # What you disconnected, which isn't connected automatically again.
+  if [[ -n $run && -r $run/omarchy-vpn-manager-held ]]; then
+    while read -r uuid; do
+      [[ -n $uuid ]] && printf 'held\t%s\n' "$uuid"
+    done <"$run/omarchy-vpn-manager-held"
+  fi
+  # A chain's copies, as the connect noted them; the helper for any it didn't.
+  if ((${#in_memory[@]})); then
+    if [[ -n $run && -r $run/omarchy-vpn-manager-hops ]]; then
+      while IFS=$'\t' read -r copy uuid name place; do
+        profile[$copy]=$uuid profile_name[$copy]=$name hop[$copy]=$place
+      done <"$run/omarchy-vpn-manager-hops"
+    fi
+    for copy in "${in_memory[@]}"; do
+      [[ -n ${profile[$copy]:-} ]] || unknown+=("$copy")
+    done
+    if ((${#unknown[@]})); then
+      while IFS=$'\t' read -r copy uuid name place; do
+        profile[$copy]=$uuid profile_name[$copy]=$name hop[$copy]=$place
+      done < <(py hops "${unknown[@]}" 2>/dev/null)
+    fi
+  fi
+  # An OpenVPN connection's interface, by its address: NetworkManager names
+  # the device it runs over instead.
+  while read -r dev addr; do
+    iface_of[${addr%/*}]=$dev
+  done < <(ip -o addr show 2>/dev/null | awk '$3 == "inet" || ($3 == "inet6" && $0 ~ / scope global/) { print $2, $4 }')
+  now=$(date +%s)
+  for line in "${vpns[@]}"; do
+    IFS=: read -r uuid type state dev file name <<<"$line"
+    dev=${dev//$'\2'/:} name=${name//$'\2'/:}
+    dev=${dev//$'\1'/\\} name=${name//$'\1'/\\}
+    kind=wg ip=""
+    if [[ $type == vpn ]]; then
+      info=$(nmcli -t -f vpn.service-type,IP4.ADDRESS,IP6.ADDRESS connection show uuid "$uuid" 2>/dev/null) || continue
+      [[ $info == *$'vpn.service-type:org.freedesktop.NetworkManager.openvpn'* ]] || continue
+      kind=ovpn
+      # An IPv6-only tunnel has no IPv4 address. nmcli escapes the colons.
+      addr=$(sed -n 's/^IP4\.ADDRESS\[1\]://p' <<<"$info")
+      [[ -n $addr ]] || addr=$(unescape "$(sed -n 's/^IP6\.ADDRESS\[1\]://p' <<<"$info")")
+      ip=${addr%/*}
+      dev=""
+      [[ -n $ip ]] && dev=${iface_of[$ip]:-}
+    fi
+    place=""
+    if [[ -n ${profile[$uuid]:-} ]]; then
+      name=${profile_name[$uuid]} place=${hop[$uuid]} uuid=${profile[$uuid]}
+    fi
+    sent=0 recv=0 secs=""
+    # The interface can go between any two of these, while disconnecting.
+    if [[ -n $dev ]]; then
+      if [[ $kind == wg ]]; then
+        ip=$(ip -o -4 addr show dev "$dev" 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }')
+        [[ -n $ip ]] || ip=$(ip -o -6 addr show dev "$dev" scope global 2>/dev/null | awk '{ split($4, a, "/"); print a[1]; exit }')
+      fi
+      read -r sent 2>/dev/null <"/sys/class/net/$dev/statistics/tx_bytes" || sent=0
+      read -r recv 2>/dev/null <"/sys/class/net/$dev/statistics/rx_bytes" || recv=0
+      # NetworkManager creates the interface when it connects and deletes it
+      # when it disconnects, so its age is the connection's.
+      if created=$(stat -c %Y "/sys/class/net/$dev" 2>/dev/null); then
+        secs=$((now - created))
+        ((secs < 0)) && secs=0
+      fi
+    fi
+    case $state in
+      activated) state=connected ;;
+      activating) state=connecting ;;
+      deactivating) state=disconnecting ;;
+    esac
+    printf 'vpn\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$uuid" "$kind" "$state" "${name//$'\t'/ }" "$ip" "$dev" "$sent" "$recv" "$secs" "$place"
+  done
+  return 0
+}
+
+cmd_candidates() {
+  local dir=${1:-$HOME/Downloads} mtime path
+  dir=${dir/#\~/$HOME}
+  [[ -d $dir ]] || return 0
+  # -H: the folder itself may be a symlink (to another drive, say). find
+  # rounds sizes up to whole units, so this is 2 MiB or less, as import allows.
+  find -H "$dir" -maxdepth 2 -type f \( -iname '*.conf' -o -iname '*.ovpn' \) -size -2049k -printf '%T@\t%p\n' 2>/dev/null |
+    sort -rn | head -n 200 |
+    while IFS=$'\t' read -r mtime path; do
+      # Only files that look like a WireGuard or OpenVPN client profile.
+      if grep -qsiE $'^(\xef\xbb\xbf)?[[:space:]]*\\[Interface\\]' "$path" && grep -qsi '^[[:space:]]*PrivateKey[[:space:]]*=' "$path"; then
+        printf '%s\twg\t%s\n' "${mtime%.*}" "$path"
+      elif grep -qsE '^[[:space:]]*(remote|client)([[:space:]]|$)' "$path"; then
+        printf '%s\tovpn\t%s\n' "${mtime%.*}" "$path"
+      fi
+    done | head -n 20
+  return 0
+}
+
+cmd_disconnect() {
+  local uuid=${1:-} out u t plan failed=0
+  need_nm
+  if [[ -z $uuid ]]; then
+    local -a forget=()
+    # A chain first, innermost first.
+    py disconnect >/dev/null || failed=1
+    while IFS=: read -r u t; do
+      [[ $t == wireguard || $t == vpn ]] || continue
+      [[ $t == vpn && $(nmcli -g vpn.service-type connection show uuid "$u" 2>/dev/null) != org.freedesktop.NetworkManager.openvpn ]] && continue
+      nmcli connection down uuid "$u" >/dev/null 2>&1 || failed=1
+      forget+=(--forget "$u")
+    done < <(nmcli -t -f UUID,TYPE connection show --active 2>/dev/null)
+    # The kill switch stops letting their servers through.
+    py sync-kill "${forget[@]}" || failed=1
+    ((failed)) && fail "Couldn't disconnect everything."
+    return 0
+  fi
+  # A profile in a chain takes the whole chain down with it.
+  plan=$(py disconnect "$uuid") || exit 1
+  [[ $plan == direct ]] || return 0
+  out=$(LC_ALL=C nmcli connection down uuid "$uuid" 2>&1)
+  # Already down is fine.
+  if [[ $? -ne 0 && $out != *"not an active connection"* ]]; then
+    fail "$(nm_error "$out" "Couldn't disconnect.")"
+  fi
+  py sync-kill --forget "$uuid"
+}
+
+# --- Editing a profile's config ---
+
+# Yes/no in the terminal; without a terminal it's no.
+ask() {
+  [[ -t 0 && -t 1 ]] || return 1
+  if command -v gum >/dev/null; then
+    gum confirm "$1"
+  else
+    local reply
+    read -rp "$1 [y/N] " reply && [[ $reply == [yY]* ]]
+  fi
+}
+
+# Your Omarchy default editor when it runs in the terminal (and so can be
+# waited for), otherwise Neovim. Each is started without your own config and
+# plugins (an AI completion plugin would send a key away) and without swap,
+# undo, history or backup files, so nothing in it is written to disk.
+edit_file() {
+  local editor=nvim
+  [[ -f $HOME/.local/state/omarchy/defaults/editor ]] && read -r editor <"$HOME/.local/state/omarchy/defaults/editor"
+  command -v "$editor" >/dev/null || editor=nvim
+  case ${editor##*/} in
+    vim) "$editor" --clean -n -i NONE "$1" ;;
+    nano) "$editor" --ignorercfiles "$1" ;;
+    micro) "$editor" -config-dir "$(dirname "$1")/micro" -backup false -savecursor false -saveundo false "$1" ;;
+    *) nvim --clean -n "$1" ;;
+  esac
+}
+
+cmd_edit() {
+  local uuid=${1:-} dir file before out name
+  [[ -n $uuid ]] || fail "No profile given."
+  [[ -t 0 && -t 1 ]] || fail "Run in a terminal."
+  need_nm
+  sweep_edits
+  umask 077
+  # The runtime dir is in memory and yours alone; the copy goes when this ends.
+  [[ -d ${XDG_RUNTIME_DIR:-} ]] || fail "No runtime folder to edit in."
+  dir=$(mktemp -d "$XDG_RUNTIME_DIR/omarchy-vpn-manager-edit.$$.XXXXXX") || fail "Couldn't create folder to edit in."
+  # Expanded now: the trap runs after this function's locals are gone.
+  # shellcheck disable=SC2064
+  trap "rm -rf $(printf %q "$dir")" EXIT
+  file=$(py export "$uuid" "$dir") || return 1
+  name=$(unescape "$(nmcli -g connection.id connection show uuid "$uuid" 2>/dev/null)")
+  echo "Editing $name. Save and quit to apply; quit without saving to cancel."
+  while true; do
+    before=$(cksum <"$file")
+    edit_file "$file"
+    if [[ $(cksum <"$file") == "$before" ]]; then
+      echo "No changes."
+      return 0
+    fi
+    if out=$(py apply "$uuid" "$file" 2>&1); then
+      echo "Saved $name."
+      if [[ $(nmcli -g GENERAL.STATE connection show uuid "$uuid" 2>/dev/null) == activated ]] &&
+        ask "$name is connected. Reconnect now to apply?"; then
+        # Held meanwhile, so the panel doesn't take the moment it's down for
+        # a drop and connect it too. An OpenVPN password not kept is asked
+        # for here.
+        # The kill switch lets its servers through as they are now.
+        py hold "$uuid" 1
+        if ! out=$(py sync-kill --for "$uuid" 2>&1); then
+          echo "Couldn't reconnect: $out" >&2
+        elif out=$(LC_ALL=C nmcli --ask connection up uuid "$uuid" 2>&1 >/dev/tty); then
+          echo "Reconnected."
+          py sync-kill
+        else
+          echo "Couldn't reconnect: $(nm_error "$out" "unknown error")" >&2
+          py sync-kill --forget "$uuid"
+        fi
+        py hold "$uuid" 0
+      fi
+      return 0
+    fi
+    out=${out//"$file"/the file}
+    echo "$out" >&2
+    ask "Edit again?" || { echo "Nothing changed."; return 0; }
+    # Keep the edits, with the reason at the end, where it doesn't move the
+    # line it's about.
+    { printf '\n'; sed 's/^/# /' <<<"$out"; } >>"$file"
+  done
+}
+
+# --- Setup ---
+
+# The bar section holding the widget, or nothing when it isn't in the bar.
+bar_section() {
+  jq -r --arg id "$PLUGIN_ID" '
+    .bar.layout // {} | to_entries[] | select(any(.value[]?; .id == $id)) | .key
+  ' "$HOME/.config/omarchy/shell.json" 2>/dev/null | head -n1
+}
+
+setup_placement() {
+  local current section
+  current=$(bar_section)
+  if command -v gum >/dev/null; then
+    section=$(printf '%s\n' left center right |
+      gum choose --header="Which bar section for the VPN icon?" --selected "${current:-right}") || return 0
+  else
+    read -rp "Which bar section for the VPN icon? (left/center/right) [${current:-right}] " section
+    section=${section:-${current:-right}}
+  fi
+  [[ $section =~ ^(left|center|right)$ ]] || return 0
+  if [[ -z $current ]]; then
+    omarchy plugin enable "$PLUGIN_ID" --section "$section"
+  elif [[ $section != "$current" ]]; then
+    omarchy bar move "$PLUGIN_ID" --section "$section" && echo "Icon moved to $section section."
+  else
+    echo "Icon stays in $section section."
+  fi
+}
+
+cmd_setup() {
+  local missing
+  if ! [[ -t 0 && -t 1 ]]; then
+    echo "Run in a terminal." >&2
+    return 1
+  fi
+  mkdir -p "${OFFERED_FILE%/*}" && touch "$OFFERED_FILE"
+  missing=$(missing_packages)
+  if [[ -z $missing ]]; then
+    echo "All required packages are installed."
+  else
+    echo "Missing packages: $missing"
+    echo "  networkmanager          manages network connections, including VPNs"
+    echo "  python-gobject          lets the plugin read and edit NetworkManager profiles"
+    echo "  networkmanager-openvpn  OpenVPN support for NetworkManager (installs openvpn); not needed for WireGuard"
+    echo "  wl-clipboard            pasting configs from the clipboard"
+    if ask "Install $missing now? (requires your password)"; then
+      # Word splitting is wanted: one argument per package.
+      # shellcheck disable=SC2086
+      omarchy pkg add $missing || echo "Install failed: $missing" >&2
+    else
+      echo "Skipped. Run setup again any time."
+    fi
+  fi
+  nm_running || echo "NetworkManager isn't running."
+  setup_placement
+  return 0
+}
+
+# Once, the first time the plugin loads: offer setup in a notification,
+# unless there's nothing to set up. Nothing changes unless it's clicked, and
+# that opens a terminal where each step is asked about again.
+cmd_offer_setup() {
+  local self missing
+  missing=$(missing_packages)
+  [[ -n $missing ]] || return 0
+  self=$(realpath "${BASH_SOURCE[0]}") || return 0
+  # Created exclusively (noclobber), so when several reloads start this at
+  # once only one of them gets past here.
+  mkdir -p "${OFFERED_FILE%/*}" 2>/dev/null || return 0
+  (set -C; : >"$OFFERED_FILE") 2>/dev/null || return 0
+  # The plugin loads with the shell, which is also the notification server,
+  # so give that a moment to come up. If it never does, or sending fails,
+  # hand the marker back so the offer is made on a later load instead.
+  for _ in {1..60}; do
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+      --method org.freedesktop.DBus.NameHasOwner org.freedesktop.Notifications 2>/dev/null | grep -q true && break
+    sleep 0.5
+  done
+  # Omarchy's own click action, unlike a libnotify one, still works from the
+  # notification history after this script has exited.
+  omarchy-notification-send --app-name VPN -g 󰖂 -u normal "VPN needs setup" \
+    "Click to install $missing and choose the icon's bar section. Or run setup from VPN panel later." \
+    --exec omarchy-launch-floating-terminal-with-presentation "$(printf '%q' "$self") setup" >/dev/null ||
+    rm -f "$OFFERED_FILE"
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  candidates) cmd_candidates "${2:-}" ;;
+  profiles | import | import-text | move | group | killswitch | save | remove | hold)
+    need_nm
+    helper "$@"
+    ;;
+  paste)
+    need_nm
+    command -v wl-paste >/dev/null || fail "Pasting needs wl-paste (wl-clipboard package). Run setup to install."
+    # Straight from the clipboard into the helper: the config is never kept here.
+    wl-paste --no-newline --type text 2>/dev/null | helper import-text --clipboard "${@:2}"
+    ;;
+  browse) helper browse "${@:2}" ;;
+  connect)
+    need_nm
+    # One process: stopping it (the panel's Cancel) stops the connect.
+    helper "$@"
+    ;;
+  disconnect) cmd_disconnect "${2:-}" ;;
+  edit) cmd_edit "${2:-}" ;;
+  setup) cmd_setup ;;
+  offer-setup) cmd_offer_setup ;;
+  *)
+    echo "usage: vpn-nm status | profiles | import <file>... | import-text [name] | paste [name]" >&2
+    echo "       vpn-nm candidates [dir] | browse [dir] | remove <uuid> | killswitch on|off" >&2
+    echo "       vpn-nm save <uuid> <name> <autoconnect 1|0> [--via <uuid>] [--user-stdin] [--password save|ask] [--password-stdin] [--all-traffic 1|0]" >&2
+    echo "       vpn-nm move <uuid> [[--above] <uuid>] | group <uuid> <name> [<autoconnect 1|0>]" >&2
+    echo "       vpn-nm connect [--auto] <uuid> [--user-stdin] [--save|--ask] [--password-stdin] [--own-table] | disconnect [uuid]" >&2
+    echo "       vpn-nm edit <uuid> | setup" >&2
+    exit 1
+    ;;
+esac

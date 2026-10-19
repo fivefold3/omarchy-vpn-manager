@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.fivefold3.vpn-manager",
+  "name": "VPN Manager",
+  "version": "1.0.0",
+  "author": "fivefold3",
+  "license": "MIT",
+  "description": "VPN manager with support for WireGuard and OpenVPN via NetworkManager. Import and edit profiles. Multi-hop nesting, internet kill switch and auto-connect.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "VPN Manager",
+    "description": "Import WireGuard .conf and OpenVPN .ovpn profiles, connect and disconnect, nest them inside each other, and bring up a connection automatically.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "importFolder": "~/Downloads"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status check interval (seconds)",
+        "description": "How often the icon checks VPN status while panel is closed.",
+        "min": 3,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "importFolder",
+        "type": "path",
+        "label": "Folder to look for profiles in",
+        "description": "Import list shows WireGuard and OpenVPN files found here. Browse starts here.",
+        "defaultValue": "~/Downloads"
+      }
+    ]
+  }
+}
